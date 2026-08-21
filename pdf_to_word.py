@@ -18,6 +18,7 @@ import base64
 import re
 import io
 import argparse
+import tempfile
 from pathlib import Path
 
 import anthropic
@@ -28,6 +29,13 @@ from docx.enum.table import WD_TABLE_ALIGNMENT
 from docx.enum.section import WD_ORIENT
 from docx.oxml.ns import qn, nsdecls
 from docx.oxml import parse_xml
+
+try:
+    import fitz  # PyMuPDF
+except ImportError:
+    fitz = None
+    print("[WARNING] PyMuPDF not installed. Images will NOT be extracted from PDF.")
+    print("[WARNING] Install it with: pip install PyMuPDF")
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -121,9 +129,10 @@ after the JSON. The JSON structure is:
         {
           "type": "figure",
           "figure_number": 1,
+          "image_index": 0,
           "caption": "Figure 1: Description of the figure",
-          "alt_text": "Descriptive alt text for accessibility",
-          "description": "Visual description of what the figure shows"
+          "alt_text": "A detailed, descriptive alt text for screen readers describing exactly what the image shows, its key visual elements, data, and meaning in context",
+          "description": "Detailed visual description of the figure"
         },
         {
           "type": "footnote",
@@ -160,6 +169,8 @@ Rules for the JSON output:
 8. Preserve the exact text — this is remediation, not paraphrase.
 9. Running headers/footers are NOT content — do not include repeated page furniture.
 10. Mid-sentence page breaks: resolve hyphenated words to whole words, split at word boundary.
+11. For EVERY image/figure on a page, include a "figure" element with "image_index" set to the 0-based index of that image on its page (first image = 0, second = 1, etc.).
+12. The "alt_text" field MUST be a thorough, descriptive text for screen readers. Describe WHAT the image shows in detail — subjects, actions, spatial relationships, colors, text within the image, data values in charts/graphs, and the image's purpose in context. Do NOT use generic descriptions like "An image" or "A figure". Aim for 1-3 sentences that convey the full meaning of the image to someone who cannot see it.
 </output_format>
 """
 
@@ -176,6 +187,101 @@ Do all these steps precisely:
 - Handle footnotes/endnotes as they appear in the source PDF.
 - Ensure page labels are in sequential order.
 - Preserve ALL original content verbatim."""
+
+
+# ---------------------------------------------------------------------------
+# PDF Image Extraction
+# ---------------------------------------------------------------------------
+
+def extract_images_from_pdf(pdf_path: str) -> dict:
+    """Extract images from a PDF, keyed by (page_index, image_index).
+
+    Strategy:
+    1. Try extracting embedded raster images per page.
+    2. If no embedded images found, render each page as a high-res PNG
+       (handles vector graphics, scanned pages, diagrams).
+
+    Returns:
+        dict mapping (page_idx, img_idx) -> PNG image bytes
+    """
+    if fitz is None:
+        print("[WARNING] PyMuPDF not available. Skipping image extraction.")
+        return {}
+
+    pdf_path = Path(pdf_path)
+    if not pdf_path.exists():
+        print(f"[WARNING] PDF not found for image extraction: {pdf_path}")
+        return {}
+
+    print("[INFO] Extracting images from PDF...")
+    extracted = {}
+    try:
+        pdf_doc = fitz.open(str(pdf_path))
+        num_pages = len(pdf_doc)
+        total_images = 0
+
+        # --- Pass 1: Try embedded raster images ---
+        for page_idx in range(num_pages):
+            page = pdf_doc[page_idx]
+            image_list = page.get_images(full=True)
+            img_on_page = 0
+
+            for img_info in image_list:
+                xref = img_info[0]
+                try:
+                    base_image = pdf_doc.extract_image(xref)
+                    if base_image is None:
+                        continue
+
+                    image_bytes = base_image["image"]
+                    image_ext = base_image.get("ext", "png")
+
+                    # Convert to PNG for consistency
+                    if image_ext.lower() != "png":
+                        try:
+                            from PIL import Image as PILImage
+                            pil_img = PILImage.open(io.BytesIO(image_bytes))
+                            png_buffer = io.BytesIO()
+                            pil_img.save(png_buffer, format="PNG")
+                            image_bytes = png_buffer.getvalue()
+                        except Exception:
+                            pass
+
+                    # Skip tiny images (icons, bullets)
+                    width = base_image.get("width", 0)
+                    height = base_image.get("height", 0)
+                    if width < 50 and height < 50:
+                        continue
+
+                    extracted[(page_idx, img_on_page)] = image_bytes
+                    img_on_page += 1
+                    total_images += 1
+
+                except Exception as e:
+                    print(f"  [WARNING] Could not extract image from page {page_idx + 1}: {e}")
+
+        # --- Pass 2: If no embedded images, render pages as screenshots ---
+        if total_images == 0:
+            print("[INFO] No embedded raster images found. Rendering pages as screenshots...")
+            for page_idx in range(num_pages):
+                page = pdf_doc[page_idx]
+                # Render at 200 DPI for good quality
+                pix = page.get_pixmap(dpi=200)
+                png_bytes = pix.tobytes("png")
+                # Store as (page_idx, 0) — one image per page
+                extracted[(page_idx, 0)] = png_bytes
+                total_images += 1
+
+            print(f"[INFO] Rendered {total_images} page screenshots.")
+        else:
+            print(f"[INFO] Extracted {total_images} embedded images from {num_pages} pages.")
+
+        pdf_doc.close()
+
+    except Exception as e:
+        print(f"[ERROR] Image extraction failed: {e}")
+
+    return extracted
 
 
 # ---------------------------------------------------------------------------
@@ -416,8 +522,16 @@ def add_footnote_text(doc, marker, text):
     text_run.font.size = FONT_SIZE
 
 
-def build_docx(data: dict, output_path: str):
-    """Build a Word document from the structured JSON data."""
+def build_docx(data: dict, output_path: str, extracted_images: dict = None):
+    """Build a Word document from the structured JSON data.
+    
+    Args:
+        data: Structured JSON from Claude.
+        output_path: Path to save the .docx file.
+        extracted_images: Dict mapping (page_idx, image_idx) -> image_bytes (PNG).
+    """
+    if extracted_images is None:
+        extracted_images = {}
     doc = Document()
 
     # -----------------------------------------------------------------------
@@ -512,35 +626,62 @@ def build_docx(data: dict, output_path: str):
                 caption = elem.get("caption", "")
                 alt_text = elem.get("alt_text", "")
                 description = elem.get("description", "")
+                image_index = elem.get("image_index", 0)
 
-                # Add figure placeholder with caption
+                # Determine caption text
                 if caption:
                     cap_text = caption
                 else:
                     cap_text = f"Figure {fig_num}" if fig_num else "Figure"
 
-                fig_para = add_paragraph_with_font(
+                # Try to insert actual image from extracted images
+                image_key = (page_idx, image_index)
+                image_inserted = False
+
+                if image_key in extracted_images:
+                    try:
+                        img_bytes = extracted_images[image_key]
+                        img_stream = io.BytesIO(img_bytes)
+                        img_para = doc.add_paragraph()
+                        img_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                        run = img_para.add_run()
+                        inline_shape = run.add_picture(img_stream, width=Inches(5.5))
+
+                        # Set alt text on the image for accessibility
+                        inline = inline_shape._inline
+                        # docPr element holds the alt text
+                        doc_pr = inline.find(qn('wp:docPr'))
+                        if doc_pr is None:
+                            doc_pr = inline.find('.//' + qn('wp:docPr'))
+                        if doc_pr is not None:
+                            effective_alt = alt_text if alt_text else (description if description else cap_text)
+                            doc_pr.set('descr', effective_alt)
+                            doc_pr.set('title', cap_text)
+
+                        image_inserted = True
+                        print(f"  [IMG] Inserted image for page {page_label}, image {image_index}")
+                    except Exception as e:
+                        print(f"  [WARNING] Failed to insert image (page {page_label}, idx {image_index}): {e}")
+
+                if not image_inserted:
+                    # Fallback: add text placeholder
+                    fig_para = add_paragraph_with_font(
+                        doc,
+                        f"[{cap_text} — image not available]",
+                        italic=True,
+                        alignment=WD_ALIGN_PARAGRAPH.CENTER,
+                    )
+
+                # Add caption below image
+                cap_para = add_paragraph_with_font(
                     doc,
-                    f"[{cap_text}]",
+                    cap_text,
+                    bold=True,
                     italic=True,
                     alignment=WD_ALIGN_PARAGRAPH.CENTER,
                 )
-
-                if alt_text:
-                    alt_para = add_paragraph_with_font(
-                        doc,
-                        f"Alt Text: {alt_text}",
-                        italic=True,
-                    )
-                    alt_para.paragraph_format.left_indent = Cm(1)
-
-                if description:
-                    desc_para = add_paragraph_with_font(
-                        doc,
-                        f"Image Description: {description}",
-                        italic=True,
-                    )
-                    desc_para.paragraph_format.left_indent = Cm(1)
+                cap_para.paragraph_format.space_before = Pt(4)
+                cap_para.paragraph_format.space_after = Pt(8)
 
             elif elem_type == "footnote":
                 marker = elem.get("marker", "")
@@ -773,9 +914,14 @@ def main():
             json.dump(data, f, indent=2, ensure_ascii=False)
         print(f"[INFO] JSON saved to: {json_path}")
 
+    # Extract images from the PDF
+    extracted_images = {}
+    if not args.from_json:
+        extracted_images = extract_images_from_pdf(args.pdf_path)
+
     # Build the Word document
     print(f"[INFO] Building Word document...")
-    build_docx(data, args.output_path)
+    build_docx(data, args.output_path, extracted_images)
 
     # Verify
     if args.verify:
