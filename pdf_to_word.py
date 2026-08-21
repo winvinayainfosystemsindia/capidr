@@ -17,12 +17,15 @@ import json
 import base64
 import re
 import io
+import html
 import argparse
 import tempfile
 from pathlib import Path
 
 import anthropic
+import docx
 from docx import Document
+from docx.opc.constants import RELATIONSHIP_TYPE
 from docx.shared import Pt, Inches, Cm, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.table import WD_TABLE_ALIGNMENT
@@ -171,6 +174,7 @@ Rules for the JSON output:
 10. Mid-sentence page breaks: resolve hyphenated words to whole words, split at word boundary.
 11. For EVERY image/figure on a page, include a "figure" element with "image_index" set to the 0-based index of that image on its page (first image = 0, second = 1, etc.).
 12. The "alt_text" field MUST be a thorough, descriptive text for screen readers. Describe WHAT the image shows in detail — subjects, actions, spatial relationships, colors, text within the image, data values in charts/graphs, and the image's purpose in context. Do NOT use generic descriptions like "An image" or "A figure". Aim for 1-3 sentences that convey the full meaning of the image to someone who cannot see it.
+13. If any text contains a web link, URL, or email address (e.g. "https://...", "http://...", "www...", or "mailto:..."), preserve the exact URL or format it as [display text](url) so that it will be rendered as an active, clickable hyperlink in the Word document.
 </output_format>
 """
 
@@ -185,6 +189,7 @@ Do all these steps precisely:
 - If figures have captions, add figure captions with sequential Figure numbers (Figure 1, Figure 2, etc.).
 - Provide appropriate Alt Text for all meaningful images.
 - Handle footnotes/endnotes as they appear in the source PDF.
+- Identify any URLs or web links in the PDF text and preserve/format them so they become active clickable hyperlinks in the output Word document.
 - Ensure page labels are in sequential order.
 - Preserve ALL original content verbatim."""
 
@@ -416,35 +421,104 @@ def extract_json(text: str) -> dict:
 # Word document builder
 # ---------------------------------------------------------------------------
 
+def add_hyperlink(paragraph, url, text, font_name=FONT_NAME, font_size_pt=12,
+                  color="0002D0", underline=True, bold=False, italic=False):
+    """Add an active, clickable Word hyperlink to a paragraph."""
+    target_url = url
+    if not target_url.startswith(("http://", "https://", "mailto:", "ftp://")):
+        target_url = "https://" + target_url
+
+    part = paragraph.part
+    r_id = part.relate_to(target_url, RELATIONSHIP_TYPE.HYPERLINK, is_external=True)
+
+    hyperlink = parse_xml(f'<w:hyperlink {nsdecls("w")} r:id="{r_id}" {nsdecls("r")}/>')
+    new_run = parse_xml(f'<w:r {nsdecls("w")}/>')
+    rPr = parse_xml(f'<w:rPr {nsdecls("w")}/>')
+
+    rPr.append(parse_xml(f'<w:rFonts {nsdecls("w")} w:ascii="{font_name}" w:hAnsi="{font_name}" w:cs="{font_name}"/>'))
+    sz_val = int(font_size_pt * 2)
+    rPr.append(parse_xml(f'<w:sz {nsdecls("w")} w:val="{sz_val}"/>'))
+
+    if color:
+        rPr.append(parse_xml(f'<w:color {nsdecls("w")} w:val="{color}"/>'))
+    if underline:
+        rPr.append(parse_xml(f'<w:u {nsdecls("w")} w:val="single"/>'))
+    if bold:
+        rPr.append(parse_xml(f'<w:b {nsdecls("w")}/>'))
+    if italic:
+        rPr.append(parse_xml(f'<w:i {nsdecls("w")}/>'))
+
+    new_run.append(rPr)
+    text_elem = parse_xml(f'<w:t {nsdecls("w")}>{html.escape(text)}</w:t>')
+    new_run.append(text_elem)
+    hyperlink.append(new_run)
+    paragraph._p.append(hyperlink)
+    return hyperlink
+
+
+def add_formatted_text(paragraph, text, bold=False, italic=False):
+    """Add text to a paragraph, automatically detecting markdown links [text](url)
+    and raw URLs (http://, https://, www., mailto:), inserting native Word hyperlinks."""
+    if not text:
+        return
+
+    # Pattern matches markdown links `[display text](url)` OR raw URLs `https://...`, `http://...`, `www....`, `mailto:...`
+    pattern = r'(\[(?P<md_text>[^\]]+)\]\((?P<md_url>https?://[^\s)]+|www\.[^\s)]+|mailto:[^\s)]+)\))|(?P<raw_url>https?://[^\s)]+|www\.[^\s)]+|mailto:[^\s)]+)'
+
+    last_idx = 0
+    for match in re.finditer(pattern, text):
+        start, end = match.span()
+        # Add preceding normal text
+        if start > last_idx:
+            normal_text = text[last_idx:start]
+            run = paragraph.add_run(normal_text)
+            run.font.name = FONT_NAME
+            run.font.size = FONT_SIZE
+            run.font.bold = bold
+            run.font.italic = italic
+            run._element.get_or_add_rPr().get_or_add_rFonts().set(qn("w:eastAsia"), FONT_NAME)
+
+        # Handle hyperlink match
+        md_text = match.group("md_text")
+        md_url = match.group("md_url")
+        raw_url = match.group("raw_url")
+
+        if md_text and md_url:
+            link_text = md_text
+            link_url = md_url
+        else:
+            link_text = raw_url
+            link_url = raw_url
+
+        add_hyperlink(paragraph, link_url, link_text, bold=bold, italic=italic)
+        last_idx = end
+
+    # Add remaining text after last match
+    if last_idx < len(text):
+        remaining_text = text[last_idx:]
+        run = paragraph.add_run(remaining_text)
+        run.font.name = FONT_NAME
+        run.font.size = FONT_SIZE
+        run.font.bold = bold
+        run.font.italic = italic
+        run._element.get_or_add_rPr().get_or_add_rFonts().set(qn("w:eastAsia"), FONT_NAME)
+
+
 def set_cell_font(cell, text, bold=False):
-    """Set font properties for a table cell."""
+    """Set font properties for a table cell, with hyperlink support."""
     cell.text = ""
     paragraph = cell.paragraphs[0]
-    run = paragraph.add_run(str(text))
-    run.font.name = FONT_NAME
-    run.font.size = FONT_SIZE
-    run.font.bold = bold
-    # Set East Asian font
-    run._element.rPr.rFonts.set(qn("w:eastAsia"), FONT_NAME)
+    add_formatted_text(paragraph, str(text), bold=bold)
 
 
 def add_paragraph_with_font(doc, text, style=None, bold=False, italic=False,
                             alignment=None):
-    """Add a paragraph with consistent Times New Roman 12pt formatting."""
+    """Add a paragraph with consistent Times New Roman 12pt formatting and active hyperlinks."""
     para = doc.add_paragraph(style=style)
     if alignment:
         para.alignment = alignment
 
-    run = para.add_run(text)
-    run.font.name = FONT_NAME
-    run.font.size = FONT_SIZE
-    run.font.bold = bold
-    run.font.italic = italic
-    # Ensure East Asian font fallback
-    rpr = run._element.get_or_add_rPr()
-    rfonts = rpr.get_or_add_rFonts()
-    rfonts.set(qn("w:eastAsia"), FONT_NAME)
-
+    add_formatted_text(para, text, bold=bold, italic=italic)
     return para
 
 
@@ -508,8 +582,7 @@ def add_table(doc, headers, rows, caption=None):
 
 
 def add_footnote_text(doc, marker, text):
-    """Add footnote as formatted text at the bottom (when not using Word's
-    native footnote mechanism for simplicity in API-generated docs)."""
+    """Add footnote as formatted text at the bottom with hyperlink support."""
     para = doc.add_paragraph()
     # Superscript marker
     marker_run = para.add_run(marker)
@@ -517,9 +590,8 @@ def add_footnote_text(doc, marker, text):
     marker_run.font.size = Pt(10)
     marker_run.font.superscript = True
     # Footnote text
-    text_run = para.add_run(f" {text}")
-    text_run.font.name = FONT_NAME
-    text_run.font.size = FONT_SIZE
+    para.add_run(" ")
+    add_formatted_text(para, text)
 
 
 def build_docx(data: dict, output_path: str, extracted_images: dict = None):
@@ -730,9 +802,7 @@ def build_docx(data: dict, output_path: str, extracted_images: dict = None):
             marker_run.font.name = FONT_NAME
             marker_run.font.size = FONT_SIZE
             marker_run.font.superscript = True
-            text_run = en_para.add_run(text)
-            text_run.font.name = FONT_NAME
-            text_run.font.size = FONT_SIZE
+            add_formatted_text(en_para, text)
 
     # -----------------------------------------------------------------------
     # Final pass: ensure ALL paragraphs use Times New Roman 12pt
