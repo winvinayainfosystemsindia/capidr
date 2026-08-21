@@ -184,7 +184,7 @@ Do all these steps precisely:
 
 def upload_pdf_and_get_response(pdf_path: str, api_key: str) -> dict:
     """Upload PDF to Claude and get structured JSON response."""
-    client = anthropic.Anthropic(api_key=api_key)
+    client = anthropic.Anthropic(api_key=api_key, timeout=3600.0)
 
     pdf_path = Path(pdf_path)
     if not pdf_path.exists():
@@ -233,10 +233,11 @@ def upload_pdf_and_get_response(pdf_path: str, api_key: str) -> dict:
             },
         ]
 
-    print(f"[INFO] Sending request to {MODEL}...")
-    print("[INFO] This may take several minutes for large documents...")
+    print(f"[INFO] Sending request to {MODEL} (streaming enabled)...")
+    print("[INFO] Receiving response from Claude...", end="", flush=True)
 
-    message = client.messages.create(
+    response_text = ""
+    with client.messages.stream(
         model=MODEL,
         max_tokens=MAX_TOKENS,
         system=SYSTEM_PROMPT,
@@ -246,15 +247,15 @@ def upload_pdf_and_get_response(pdf_path: str, api_key: str) -> dict:
                 "content": content,
             }
         ],
-    )
+    ) as stream:
+        for text in stream.text_stream:
+            response_text += text
+            print(".", end="", flush=True)
 
+        message = stream.get_final_message()
+
+    print()
     print(f"[INFO] Response received. Usage: {message.usage}")
-
-    # Extract text from response
-    response_text = ""
-    for block in message.content:
-        if hasattr(block, "text"):
-            response_text += block.text
 
     # Check if response was truncated
     if message.stop_reason == "max_tokens":
@@ -684,7 +685,23 @@ def verify_document(doc_path: str):
 # Main
 # ---------------------------------------------------------------------------
 
+def load_env_file():
+    """Load variables from .env file if present."""
+    env_path = Path(".env")
+    if env_path.exists():
+        with open(env_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, value = line.split("=", 1)
+                    key = key.strip()
+                    value = value.strip().strip("'\"")
+                    if key and not os.environ.get(key):
+                        os.environ[key] = value
+
+
 def main():
+    load_env_file()
     parser = argparse.ArgumentParser(
         description="Convert PDF to accessible Word document using Claude Opus API"
     )
