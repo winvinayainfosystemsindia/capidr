@@ -175,6 +175,7 @@ Rules for the JSON output:
 11. For EVERY image/figure on a page, include a "figure" element with "image_index" set to the 0-based index of that image on its page (first image = 0, second = 1, etc.).
 12. The "alt_text" field MUST be a thorough, descriptive text for screen readers. Describe WHAT the image shows in detail — subjects, actions, spatial relationships, colors, text within the image, data values in charts/graphs, and the image's purpose in context. Do NOT use generic descriptions like "An image" or "A figure". Aim for 1-3 sentences that convey the full meaning of the image to someone who cannot see it.
 13. If any text contains a web link, URL, or email address (e.g. "https://...", "http://...", "www...", or "mailto:..."), preserve the exact URL or format it as [display text](url) so that it will be rendered as an active, clickable hyperlink in the Word document.
+14. For ordered (numbered) and unordered (bulleted) lists, ensure they are strictly separated by section/block. Set "ordered": true for numbered lists (1, 2, a, b) and "ordered": false for bullet lists. Do NOT combine separate lists from different sections into a single continuous list.
 </output_format>
 """
 
@@ -190,6 +191,7 @@ Do all these steps precisely:
 - Provide appropriate Alt Text for all meaningful images.
 - Handle footnotes/endnotes as they appear in the source PDF.
 - Identify any URLs or web links in the PDF text and preserve/format them so they become active clickable hyperlinks in the output Word document.
+- Distinguish ordered (numbered) vs unordered (bulleted) lists clearly section by section so list numbering restarts per section.
 - Ensure page labels are in sequential order.
 - Preserve ALL original content verbatim."""
 
@@ -630,6 +632,20 @@ def build_docx(data: dict, output_path: str, extracted_images: dict = None):
             list_style.font.name = FONT_NAME
             list_style.font.size = FONT_SIZE
 
+    # Initialize numbering definitions element
+    dummy = doc.add_paragraph("dummy", style="List Number")
+    dummy._element.getparent().remove(dummy._element)
+
+    numbering_element = None
+    if hasattr(doc.part, "numbering_part") and doc.part.numbering_part is not None:
+        try:
+            numbering_element = doc.part.numbering_part.numbering_definitions._numbering
+        except Exception:
+            numbering_element = None
+
+    current_ordered_num_id = None
+    current_bullet_num_id = None
+
     # -----------------------------------------------------------------------
     # Document title (Heading 1)
     # -----------------------------------------------------------------------
@@ -661,6 +677,8 @@ def build_docx(data: dict, output_path: str, extracted_images: dict = None):
             elem_type = elem.get("type", "paragraph")
 
             if elem_type == "heading":
+                current_ordered_num_id = None
+                current_bullet_num_id = None
                 level = elem.get("level", 2)
                 level = max(1, min(level, 4))  # Clamp to 1-4
                 text = elem.get("text", "")
@@ -673,6 +691,8 @@ def build_docx(data: dict, output_path: str, extracted_images: dict = None):
                         run.font.italic = True
 
             elif elem_type == "paragraph":
+                current_ordered_num_id = None
+                current_bullet_num_id = None
                 text = elem.get("text", "")
                 if not text.strip():
                     doc.add_paragraph()
@@ -684,16 +704,48 @@ def build_docx(data: dict, output_path: str, extracted_images: dict = None):
             elif elem_type == "list_item":
                 text = elem.get("text", "")
                 ordered = elem.get("ordered", False)
+                item_level = elem.get("level", 0)
                 style_name = "List Number" if ordered else "List Bullet"
-                add_paragraph_with_font(doc, text, style=style_name)
+                para = add_paragraph_with_font(doc, text, style=style_name)
+
+                if ordered:
+                    current_bullet_num_id = None
+                    if current_ordered_num_id is None and numbering_element is not None:
+                        try:
+                            current_ordered_num_id = numbering_element.add_num(1).numId
+                        except Exception:
+                            current_ordered_num_id = None
+
+                    if current_ordered_num_id is not None:
+                        num_pr = para._element.get_or_add_pPr().get_or_add_numPr()
+                        num_pr.get_or_add_numId().val = current_ordered_num_id
+                        if item_level > 0:
+                            num_pr.get_or_add_ilvl().val = item_level
+                else:
+                    current_ordered_num_id = None
+                    if current_bullet_num_id is None and numbering_element is not None:
+                        try:
+                            current_bullet_num_id = numbering_element.add_num(0).numId
+                        except Exception:
+                            current_bullet_num_id = None
+
+                    if current_bullet_num_id is not None:
+                        num_pr = para._element.get_or_add_pPr().get_or_add_numPr()
+                        num_pr.get_or_add_numId().val = current_bullet_num_id
+                        if item_level > 0:
+                            num_pr.get_or_add_ilvl().val = item_level
 
             elif elem_type == "table":
+                current_ordered_num_id = None
+                current_bullet_num_id = None
                 headers = elem.get("headers", [])
                 rows = elem.get("rows", [])
                 caption = elem.get("caption", None)
                 add_table(doc, headers, rows, caption)
 
             elif elem_type == "figure":
+                current_ordered_num_id = None
+                current_bullet_num_id = None
                 fig_num = elem.get("figure_number", "")
                 caption = elem.get("caption", "")
                 alt_text = elem.get("alt_text", "")
