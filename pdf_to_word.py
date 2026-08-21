@@ -175,7 +175,10 @@ Rules for the JSON output:
 11. For EVERY image/figure on a page, include a "figure" element with "image_index" set to the 0-based index of that image on its page (first image = 0, second = 1, etc.).
 12. The "alt_text" field MUST be a thorough, descriptive text for screen readers. Describe WHAT the image shows in detail — subjects, actions, spatial relationships, colors, text within the image, data values in charts/graphs, and the image's purpose in context. Do NOT use generic descriptions like "An image" or "A figure". Aim for 1-3 sentences that convey the full meaning of the image to someone who cannot see it.
 13. If any text contains a web link, URL, or email address (e.g. "https://...", "http://...", "www...", or "mailto:..."), preserve the exact URL or format it as [display text](url) so that it will be rendered as an active, clickable hyperlink in the Word document.
-14. For ordered (numbered) and unordered (bulleted) lists, ensure they are strictly separated by section/block. Set "ordered": true for numbered lists (1, 2, a, b) and "ordered": false for bullet lists. Do NOT combine separate lists from different sections into a single continuous list.
+14. LIST FIDELITY (CRITICAL REQUIREMENT):
+    - UNORDERED (BULLETED) LISTS: When items in the source PDF begin with a bullet symbol (e.g. •, -, ◦, ▪, ★), you MUST set "ordered": false. NEVER convert bulleted items into numbers (1., 2., etc.).
+    - ORDERED (NUMBERED) LISTS: When items in the source PDF begin with numbers or letters (e.g. 1., 2., 3., a., b., (1), (a), i., ii.), you MUST set "ordered": true. NEVER convert numbered items into bullet points.
+    - NUMBERING SEQUENCE: Each distinct section or group of items in the PDF is an independent list. Ensure numbered lists restart fresh at 1 for each new section as presented in the PDF.
 </output_format>
 """
 
@@ -191,7 +194,10 @@ Do all these steps precisely:
 - Provide appropriate Alt Text for all meaningful images.
 - Handle footnotes/endnotes as they appear in the source PDF.
 - Identify any URLs or web links in the PDF text and preserve/format them so they become active clickable hyperlinks in the output Word document.
-- Distinguish ordered (numbered) vs unordered (bulleted) lists clearly section by section so list numbering restarts per section.
+- STRICT LIST FIDELITY: Inspect the PDF carefully for list formatting:
+  * If the PDF shows bullet symbols (•, -, ▪), format strictly as UNORDERED bullet list ("ordered": false). Do NOT convert bullets to numbers.
+  * If the PDF shows numbers/letters (1., 2., 3., a., b.), format strictly as ORDERED numbered list ("ordered": true).
+  * Ensure numbered lists restart at 1 for each new section as in the PDF.
 - Ensure page labels are in sequential order.
 - Preserve ALL original content verbatim."""
 
@@ -596,6 +602,63 @@ def add_footnote_text(doc, marker, text):
     add_formatted_text(para, text)
 
 
+def clean_list_text_prefix(text: str, ordered: bool) -> str:
+    """Clean leading list markers (e.g. '1. ', 'a) ', '(i) ', '• ', '- ') from list item text
+    to prevent duplicate prefix numbers/bullets when Word list styles are applied."""
+    if not text:
+        return text
+    text = text.strip()
+    if ordered:
+        text = re.sub(r'^(?:\([0-9a-zA-Z]+\)|[0-9a-zA-Z]+[\.\)])\s*', '', text)
+    else:
+        text = re.sub(r'^[•\-\*\u25aa\u25cf\u25e6\u25cb\u2013\u2014]\s*', '', text)
+    return text.strip()
+
+
+def get_list_abstract_num_id(doc, style_name="List Number", default_id=7):
+    """Find the abstractNumId used by a list style in python-docx."""
+    try:
+        style = doc.styles[style_name]
+        pPr = style._element.find(docx.oxml.ns.qn('w:pPr'))
+        if pPr is not None:
+            numPr = pPr.find(docx.oxml.ns.qn('w:numPr'))
+            if numPr is not None:
+                numId_elem = numPr.find(docx.oxml.ns.qn('w:numId'))
+                if numId_elem is not None:
+                    style_num_id = numId_elem.get(docx.oxml.ns.qn('w:val'))
+                    numbering = doc.part.numbering_part.numbering_definitions._numbering
+                    for num in numbering.findall(docx.oxml.ns.qn('w:num')):
+                        if num.get(docx.oxml.ns.qn('w:numId')) == style_num_id:
+                            ab_elem = num.find(docx.oxml.ns.qn('w:abstractNumId'))
+                            if ab_elem is not None:
+                                return int(ab_elem.get(docx.oxml.ns.qn('w:val')))
+    except Exception:
+        pass
+    return default_id
+
+
+def create_numbered_list_instance(doc, start=1):
+    """Create a new <w:num> instance that restarts numbering at `start` with lvlOverride."""
+    try:
+        numbering = doc.part.numbering_part.numbering_definitions._numbering
+        abstract_id = get_list_abstract_num_id(doc, "List Number", 7)
+        num_ids = [int(num.get(docx.oxml.ns.qn('w:numId'))) for num in numbering.findall(docx.oxml.ns.qn('w:num'))]
+        new_num_id = max(num_ids) + 1 if num_ids else 100
+
+        num_xml = f'''
+        <w:num {nsdecls("w")} w:numId="{new_num_id}">
+            <w:abstractNumId w:val="{abstract_id}"/>
+            <w:lvlOverride w:ilvl="0">
+                <w:startOverride w:val="{start}"/>
+            </w:lvlOverride>
+        </w:num>
+        '''
+        numbering.append(parse_xml(num_xml))
+        return new_num_id
+    except Exception:
+        return None
+
+
 def build_docx(data: dict, output_path: str, extracted_images: dict = None):
     """Build a Word document from the structured JSON data.
     
@@ -677,8 +740,8 @@ def build_docx(data: dict, output_path: str, extracted_images: dict = None):
             elem_type = elem.get("type", "paragraph")
 
             if elem_type == "heading":
+                current_list_type = None
                 current_ordered_num_id = None
-                current_bullet_num_id = None
                 level = elem.get("level", 2)
                 level = max(1, min(level, 4))  # Clamp to 1-4
                 text = elem.get("text", "")
@@ -691,8 +754,8 @@ def build_docx(data: dict, output_path: str, extracted_images: dict = None):
                         run.font.italic = True
 
             elif elem_type == "paragraph":
+                current_list_type = None
                 current_ordered_num_id = None
-                current_bullet_num_id = None
                 text = elem.get("text", "")
                 if not text.strip():
                     doc.add_paragraph()
@@ -702,19 +765,20 @@ def build_docx(data: dict, output_path: str, extracted_images: dict = None):
                 add_paragraph_with_font(doc, text, bold=bold, italic=italic)
 
             elif elem_type == "list_item":
-                text = elem.get("text", "")
+                raw_text = elem.get("text", "")
                 ordered = elem.get("ordered", False)
                 item_level = elem.get("level", 0)
+
+                # Clean any explicit prefixes (e.g., '1. ', '• ') from the text to prevent double bullets/numbers
+                text = clean_list_text_prefix(raw_text, ordered)
+
                 style_name = "List Number" if ordered else "List Bullet"
                 para = add_paragraph_with_font(doc, text, style=style_name)
 
                 if ordered:
-                    current_bullet_num_id = None
-                    if current_ordered_num_id is None and numbering_element is not None:
-                        try:
-                            current_ordered_num_id = numbering_element.add_num(1).numId
-                        except Exception:
-                            current_ordered_num_id = None
+                    if current_list_type != "ordered" or current_ordered_num_id is None:
+                        current_ordered_num_id = create_numbered_list_instance(doc, start=1)
+                        current_list_type = "ordered"
 
                     if current_ordered_num_id is not None:
                         num_pr = para._element.get_or_add_pPr().get_or_add_numPr()
@@ -722,30 +786,23 @@ def build_docx(data: dict, output_path: str, extracted_images: dict = None):
                         if item_level > 0:
                             num_pr.get_or_add_ilvl().val = item_level
                 else:
+                    current_list_type = "unordered"
                     current_ordered_num_id = None
-                    if current_bullet_num_id is None and numbering_element is not None:
-                        try:
-                            current_bullet_num_id = numbering_element.add_num(0).numId
-                        except Exception:
-                            current_bullet_num_id = None
-
-                    if current_bullet_num_id is not None:
+                    if item_level > 0:
                         num_pr = para._element.get_or_add_pPr().get_or_add_numPr()
-                        num_pr.get_or_add_numId().val = current_bullet_num_id
-                        if item_level > 0:
-                            num_pr.get_or_add_ilvl().val = item_level
+                        num_pr.get_or_add_ilvl().val = item_level
 
             elif elem_type == "table":
+                current_list_type = None
                 current_ordered_num_id = None
-                current_bullet_num_id = None
                 headers = elem.get("headers", [])
                 rows = elem.get("rows", [])
                 caption = elem.get("caption", None)
                 add_table(doc, headers, rows, caption)
 
             elif elem_type == "figure":
+                current_list_type = None
                 current_ordered_num_id = None
-                current_bullet_num_id = None
                 fig_num = elem.get("figure_number", "")
                 caption = elem.get("caption", "")
                 alt_text = elem.get("alt_text", "")
