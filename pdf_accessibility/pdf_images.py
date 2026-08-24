@@ -1,25 +1,27 @@
 """PDF image extraction: embedded rasters first, then a caption-anchored crop
-of vector-drawn figures (the common case for geometry/statistics diagrams in
-textbook PDFs, which are drawn as PDF vector paths rather than embedded
-images), with a full-page-screenshot fallback only for genuinely scanned
-pages.
+of vector-drawn figures, with a complexity-based fallback for uncaptioned
+vector diagrams, and a full-page screenshot only as a last resort for
+genuinely scanned pages.
 
-Why not just crop the union of every vector drawing on the page? Real-world
-PDFs draw page furniture -- a full-bleed decorative border, printer's crop
-marks, colour-registration swatches -- as vector paths too, indistinguishable
-from a real figure by shape alone. And these textbook pages also carry
-colour-block callout boxes (definition/note boxes) that are themselves
-vector-drawn rectangles but aren't figures. Reliably telling the two apart
-by geometry alone is fragile. Instead, this module anchors on the figure's
-own caption ("படம் N.N" -- Tamil for "Figure N.N", printed under every
-diagram in this document) and crops to the vector cluster that sits directly
-above it, which is both simpler and matches the "Figures: sequential
-captions only for images that carry captions in the source" rule the LLM
-extraction step is already instructed to follow -- so the figure this module
-crops lines up with the figure the JSON describes.
+Generic by design -- nothing here is tied to one document's language,
+caption wording, or layout:
+  - A caption is identified structurally (a short, numbered, isolated text
+    block), never by matching a specific word -- "படம் 3.4", "Figure 3.4",
+    "Fig. 2", "Abbildung 5", a bare "3.4", all match the same rule.
+  - A figure is told apart from decorative chrome (a colored callout/
+    definition box, a section badge or logo, an equation's vector-drawn
+    root sign or fraction bar) by how it's actually drawn, not by guessing
+    at what it depicts: diagrams are built from unfilled stroked lines and
+    curves; decorative panels are built from solid fills; a caption-like
+    label drawn *on top of* a shape (a box header, a badge caption) marks
+    it as chrome rather than a figure with a genuine adjacent caption.
+  - Diagrams with no caption at all still get extracted, via the same
+    shape-based scoring used to reject decorative elements, applied to
+    every remaining vector cluster on the page.
 """
 
 import io
+import re
 from pathlib import Path
 
 try:
@@ -30,13 +32,12 @@ except ImportError:
     print("[WARNING] Install it with: pip install PyMuPDF")
 
 # A page is only screenshotted whole when it has less than this much
-# extractable text -- i.e. it looks like a genuine scanned page-as-image,
-# not a text page that simply has no captioned figure on it.
+# extractable text -- i.e. it looks like a genuine scanned page-as-image.
 SCANNED_PAGE_TEXT_THRESHOLD = 20
 
 # A single vector-drawing rect covering at least this fraction of the page
-# in BOTH dimensions is page furniture (the printed border/frame) rather
-# than a distinct figure, and is dropped before any clustering happens.
+# in BOTH dimensions is page furniture (a printed border/frame) rather than
+# a distinct figure, and is dropped before any clustering happens.
 FURNITURE_MIN_PAGE_FRACTION = 0.85
 
 # Points of padding added around a detected figure so the crop doesn't clip
@@ -44,20 +45,45 @@ FURNITURE_MIN_PAGE_FRACTION = 0.85
 # (see _pad_without_clipping_text).
 FIGURE_BBOX_PADDING = 10
 
-# How far (points) a vector cluster's bottom edge may sit above a caption's
-# top edge and still count as "directly above" it.
-CAPTION_VERTICAL_SLACK = 6
-
-# How far (points) a vector cluster may sit outside a caption's left/right
-# edges and still count as being in the same column as it.
+# How far (points) a vector cluster's near edge may sit from a caption's
+# near edge and still count as "belonging to" it.
+CAPTION_VERTICAL_SLACK = 8
 CAPTION_HORIZONTAL_SLACK = 60
+CAPTION_MAX_GAP = 40
 
-# Caption words for "படம்" (Tamil for "figure") sometimes extract as
-# "படடம்" -- an extra consonant glyph -- depending on how the source PDF
-# shaped/ordered the glyphs. Match the stable prefix instead of the exact
-# word, and keep it short so this doesn't also match unrelated body text.
-FIGURE_CAPTION_PREFIX = "பட"
-FIGURE_CAPTION_MAX_LEN = 6
+# A caption candidate is a short, numbered, otherwise-isolated line of text
+# -- independent of language or the word used for "figure". 2 words keeps
+# out lone equation-number labels like "(1)"; 6 keeps out full sentences
+# that merely happen to contain a number.
+CAPTION_MIN_WORDS = 2
+CAPTION_MAX_WORDS = 6
+_HAS_DIGIT_RE = re.compile(r"\d")
+
+# --- Fallback tier: pages with vector diagrams but no detected caption ---
+# A genuine diagram (circle + radius line + labels, an axis system, a bar
+# chart, ...) is drawn from many separate path items -- lines, bezier
+# curves, point markers. A decorative callout/definition box is typically
+# one or two fill/stroke paths for the box itself. This threshold is what
+# tells them apart when there's no caption to anchor to.
+MIN_FIGURE_STROKE_ITEMS = 3
+MAX_FILL_AREA_FRACTION = 0.5
+MIN_FIGURE_SIZE = 30  # points, both width and height
+MAX_FIGURE_PAGE_FRACTION = 0.5  # both width and height, vs. the page
+
+# A cluster with no curved (bezier) stroke at all -- straight lines only --
+# and a wide, flat aspect ratio is far more often a piece of math notation
+# (a root sign, a fraction bar, a bracket -- all drawn from straight
+# lines) than a diagram. Real diagrams almost always contain at least one
+# curve (a circle, an arc) or are closer to square. This only rejects the
+# straight-AND-wide combination, so genuinely straight-edged diagrams
+# (a square, a triangle, a modestly-proportioned bar chart) are unaffected.
+MAX_ASPECT_WITHOUT_CURVE = 2.5
+
+# Headers/footers (running titles, page numbers, file/print metadata) live
+# in a thin band at the very top/bottom of the page and can otherwise look
+# exactly like a short numbered caption ("Page 12", a date stamp). Caption
+# candidates inside this margin band are ignored.
+PAGE_MARGIN_BAND_FRACTION = 0.06
 
 
 def _is_furniture(rect, page_rect):
@@ -100,12 +126,13 @@ def _safe_union(a, b):
     )
 
 
-def _cluster_rects(rects, pad=12):
-    """Merge overlapping/nearby vector-drawing rects into one bounding box
-    per distinct figure. A diagram is made of many small, separate path
-    rects (lines, bezier arcs, point dots) sitting close together --
-    clustering recombines them into a single box per figure."""
-    clusters = [fitz.Rect(r) for r in rects]
+def _cluster_shapes(shapes, pad=12):
+    """Merge overlapping/nearby vector-drawing shapes into one shape per
+    distinct figure. `shapes` is a list of {"rect": fitz.Rect, "items": n}.
+    A diagram is made of many small, separate path rects (lines, bezier
+    arcs, point dots) sitting close together -- clustering recombines them
+    into a single box (with a summed item count) per figure."""
+    clusters = [dict(s) for s in shapes]
     changed = True
     while changed:
         changed = False
@@ -114,12 +141,16 @@ def _cluster_rects(rects, pad=12):
         for i, base in enumerate(clusters):
             if used[i]:
                 continue
-            base = fitz.Rect(base)
+            base = dict(base)
             for j in range(i + 1, len(clusters)):
                 if used[j]:
                     continue
-                if _rects_close(base, clusters[j], pad):
-                    base = _safe_union(base, clusters[j])
+                if _rects_close(base["rect"], clusters[j]["rect"], pad):
+                    base["rect"] = _safe_union(base["rect"], clusters[j]["rect"])
+                    base["items"] += clusters[j]["items"]
+                    base["stroke_items"] += clusters[j]["stroke_items"]
+                    base["fill_area"] += clusters[j]["fill_area"]
+                    base["has_curve"] = base["has_curve"] or clusters[j]["has_curve"]
                     used[j] = True
                     changed = True
             used[i] = True
@@ -128,15 +159,45 @@ def _cluster_rects(rects, pad=12):
     return clusters
 
 
-def _find_figure_captions(page):
-    """Locate 'படம் N.N' caption words on the page, sorted top-to-bottom."""
-    caps = []
-    for w in page.get_text("words"):
-        x0, y0, x1, y1, text = w[0], w[1], w[2], w[3], w[4]
-        if text.startswith(FIGURE_CAPTION_PREFIX) and len(text) <= FIGURE_CAPTION_MAX_LEN:
-            caps.append(fitz.Rect(x0, y0, x1, y1))
-    caps.sort(key=lambda r: r.y0)
-    return caps
+def _find_caption_candidates(page):
+    """Locate short, numbered, isolated text blocks -- caption candidates
+    -- sorted top-to-bottom. Works for any language/caption word ("Figure
+    3.4", "படம் 3.4", "Fig. 2", a bare "3.4", ...): a caption is identified
+    structurally (short + numbered + its own text block), never by
+    matching a specific word.
+    """
+    candidates = []
+    try:
+        page_dict = page.get_text("dict")
+    except Exception:
+        return candidates
+
+    page_rect = page.rect
+    top_band = page_rect.y0 + PAGE_MARGIN_BAND_FRACTION * page_rect.height
+    bottom_band = page_rect.y1 - PAGE_MARGIN_BAND_FRACTION * page_rect.height
+
+    for block in page_dict.get("blocks", []):
+        if block.get("type") != 0:  # text blocks only
+            continue
+        words = []
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                text = span.get("text", "")
+                words.extend(text.split())
+        if not (CAPTION_MIN_WORDS <= len(words) <= CAPTION_MAX_WORDS):
+            continue
+        if not any(_HAS_DIGIT_RE.search(w) for w in words):
+            continue
+        bbox = block.get("bbox")
+        if not bbox:
+            continue
+        r = fitz.Rect(bbox)
+        if r.y0 < top_band or r.y1 > bottom_band:
+            continue  # header/footer margin band
+        candidates.append(r)
+
+    candidates.sort(key=lambda r: r.y0)
+    return candidates
 
 
 def _expand_with_labels(rect, words, band_gap=55, band_min_overlap=6):
@@ -198,10 +259,20 @@ def _pad_without_clipping_text(rect, words, pad):
     )
 
 
-def _vector_figure_bboxes(page):
-    """Return one tightly-cropped bounding box per captioned figure on the
-    page, in top-to-bottom order. Empty list if the page has no vector
-    drawings or no 'படம் N.N' captions."""
+def _collect_shapes(page):
+    """Non-furniture vector-drawing shapes on the page, each as
+    {"rect": fitz.Rect, "items": path-item count, "stroke_items": count of
+    items that are pure unfilled strokes}.
+
+    The stroke/fill split matters: a genuine diagram (a circle, an axis
+    system, a plotted line) is drawn almost entirely from unfilled stroked
+    paths -- lines and curves -- with at most a couple of small filled
+    markers (an arrowhead, a point dot). Decorative chrome -- a colored
+    callout-box background, an icon/badge/logo -- is drawn from filled
+    shapes, rarely if ever a bare stroke. That split is what lets this
+    module tell "Definition 3.2"'s colored box, or a section badge, apart
+    from an actual figure, generically, in any document.
+    """
     try:
         drawings = page.get_drawings()
     except Exception:
@@ -210,7 +281,7 @@ def _vector_figure_bboxes(page):
         return []
 
     page_rect = page.rect
-    rects = []
+    shapes = []
     for d in drawings:
         r = d.get("rect")
         if r is None:
@@ -223,42 +294,132 @@ def _vector_figure_bboxes(page):
             continue
         if _is_furniture(r, page_rect):
             continue
-        rects.append(r)
-    if not rects:
+        item_count = max(1, len(d.get("items", [])))
+        is_stroke_only = d.get("type") == "s"
+        is_fillish = d.get("type") in ("f", "fs")
+        has_curve = any(it[0] == "c" for it in d.get("items", []))
+        shapes.append({
+            "rect": r,
+            "items": item_count,
+            "stroke_items": item_count if is_stroke_only else 0,
+            "fill_area": (r.width * r.height) if is_fillish else 0.0,
+            "has_curve": has_curve,
+        })
+    return shapes
+
+
+def _finalize_bbox(rect, page):
+    """Expand a raw cluster rect with nearby labels and safe padding."""
+    words = page.get_text("words")
+    r = _expand_with_labels(rect, words)
+    r = _pad_without_clipping_text(r, words, FIGURE_BBOX_PADDING)
+    return r & page.rect
+
+
+def _caption_mostly_inside(shape_rect, cap_rect, threshold=0.5):
+    """True when a large majority of the caption's own area is covered by
+    `shape_rect` -- i.e. the caption text is drawn essentially on top of
+    the shape (a callout-box header, a badge/logo label), not merely
+    touching its edge. A real figure's caption can legitimately graze the
+    diagram's bounding box by a few points (an axis line ending close to
+    where the caption starts) without being "inside" it in this sense, so
+    this needs to be a fraction-of-area test, not a bare intersects().
+    """
+    ix0, iy0 = max(shape_rect.x0, cap_rect.x0), max(shape_rect.y0, cap_rect.y0)
+    ix1, iy1 = min(shape_rect.x1, cap_rect.x1), min(shape_rect.y1, cap_rect.y1)
+    iw, ih = max(0.0, ix1 - ix0), max(0.0, iy1 - iy0)
+    cap_area = max(1e-6, cap_rect.width * cap_rect.height)
+    return (iw * ih) / cap_area >= threshold
+
+
+def _looks_like_figure(cluster, page_rect):
+    """Universal sanity filter applied to every candidate cluster, whether
+    it was matched via a caption or picked up by the no-caption fallback:
+    - too small (a bullet, a stray symbol)
+    - covering most of the page (a background panel)
+    - not enough unfilled stroked paths (a diagram is line art -- a
+      decorative color box, icon, or badge is drawn from fills, not
+      strokes; see _collect_shapes)
+    is never a figure.
+    """
+    r = cluster["rect"]
+    if r.width < MIN_FIGURE_SIZE or r.height < MIN_FIGURE_SIZE:
+        return False
+    if r.width > MAX_FIGURE_PAGE_FRACTION * page_rect.width and r.height > MAX_FIGURE_PAGE_FRACTION * page_rect.height:
+        return False
+    if cluster["stroke_items"] < MIN_FIGURE_STROKE_ITEMS:
+        return False
+    cluster_area = max(1.0, r.width * r.height)
+    if cluster["fill_area"] / cluster_area > MAX_FILL_AREA_FRACTION:
+        return False
+    if not cluster["has_curve"]:
+        aspect = max(r.width, r.height) / max(1.0, min(r.width, r.height))
+        if aspect > MAX_ASPECT_WITHOUT_CURVE:
+            return False
+    return True
+
+
+def _vector_figure_bboxes(page):
+    """Return one tightly-cropped bounding box per figure on the page, in
+    top-to-bottom order. Prefers anchoring each figure to a nearby caption
+    (works for any language/wording); if the page has vector diagrams but
+    no caption at all, falls back to picking out clusters that look like
+    real diagrams by path density/size rather than a decorative box.
+    """
+    shapes = _collect_shapes(page)
+    if not shapes:
         return []
 
-    clusters = _cluster_rects(rects)
-    captions = _find_figure_captions(page)
-    if not captions:
-        return []
+    clusters = _cluster_shapes(shapes)
+    captions = _find_caption_candidates(page)
 
-    used = [False] * len(clusters)
     bboxes = []
-    for cap in captions:
-        # Pick the nearest not-yet-used cluster sitting directly above this
-        # caption, in the same column.
-        best_idx, best_gap = None, None
-        for idx, cl in enumerate(clusters):
-            if used[idx]:
-                continue
-            if cl.y1 > cap.y0 + CAPTION_VERTICAL_SLACK:
-                continue
-            if cl.x1 < cap.x0 - CAPTION_HORIZONTAL_SLACK or cl.x0 > cap.x1 + CAPTION_HORIZONTAL_SLACK:
-                continue
-            gap = cap.y0 - cl.y1
-            if best_gap is None or gap < best_gap:
-                best_gap, best_idx = gap, idx
+    used = [False] * len(clusters)
+    page_rect = page.rect
 
-        if best_idx is not None:
-            used[best_idx] = True
-            r = clusters[best_idx]
-            words = page.get_text("words")
-            r = _expand_with_labels(r, words)
-            r = _pad_without_clipping_text(r, words, FIGURE_BBOX_PADDING)
-            r = r & page_rect
-            bboxes.append(r)
+    if captions:
+        for cap in captions:
+            best_idx, best_gap = None, None
+            for idx, cl in enumerate(clusters):
+                if used[idx] or not _looks_like_figure(cl, page_rect):
+                    continue
+                cr = cl["rect"]
+                if _caption_mostly_inside(cr, cap):
+                    continue  # caption drawn on top of the shape -> a label, not a figure caption
+                # caption directly below the cluster, or directly above it
+                below = cr.y1 <= cap.y0 + CAPTION_VERTICAL_SLACK
+                above = cap.y1 <= cr.y0 + CAPTION_VERTICAL_SLACK
+                if not (below or above):
+                    continue
+                if cr.x1 < cap.x0 - CAPTION_HORIZONTAL_SLACK or cr.x0 > cap.x1 + CAPTION_HORIZONTAL_SLACK:
+                    continue
+                gap = (cap.y0 - cr.y1) if below else (cr.y0 - cap.y1)
+                if gap > CAPTION_MAX_GAP:
+                    continue
+                if best_gap is None or gap < best_gap:
+                    best_gap, best_idx = gap, idx
 
-    return bboxes
+            if best_idx is not None:
+                used[best_idx] = True
+                r = clusters[best_idx]["rect"]
+                bboxes.append((r, r.y0))
+
+    # Fallback: any remaining/unused cluster that looks like a genuine
+    # diagram (not a decorative box) by path density and size, even
+    # without a caption to anchor it to. A cluster that has ANY caption
+    # candidate drawn on top of it (a callout-box header, a badge label)
+    # is a labeled decorative element, not a bare figure -- skip it.
+    for idx, cl in enumerate(clusters):
+        if used[idx] or not _looks_like_figure(cl, page_rect):
+            continue
+        if any(_caption_mostly_inside(cl["rect"], cap) for cap in captions):
+            continue
+        used[idx] = True
+        r = cl["rect"]
+        bboxes.append((r, r.y0))
+
+    bboxes.sort(key=lambda t: t[1])
+    return [_finalize_bbox(r, page) for r, _ in bboxes]
 
 
 def extract_images_from_pdf(pdf_path: str) -> dict:
@@ -268,13 +429,16 @@ def extract_images_from_pdf(pdf_path: str) -> dict:
     1. Extract any embedded raster images as-is (photos, or a figure saved
        as an actual image XObject) -- these are already a clean crop.
     2. Otherwise, for diagrams drawn as PDF vector paths (the common case
-       for geometry/statistics figures in textbook PDFs), find each
-       'படம் N.N' caption and crop tightly to the drawing cluster sitting
-       directly above it, expanded to include its point/axis labels.
+       for figures in textbook/scientific PDFs), find each figure caption
+       -- in whatever language/wording, detected structurally rather than
+       by matching specific words -- and crop tightly to the drawing
+       cluster next to it, expanded to include its point/axis labels. If a
+       page has vector diagrams but no caption at all, fall back to
+       picking out clusters that look like real diagrams by path density.
     3. Only if a page has almost no extractable text at all (a genuine
        scanned page) is it captured as one full-page screenshot. Ordinary
-       text pages with no embedded image and no captioned vector figure are
-       left with no image, rather than being screenshotted whole.
+       text pages with no embedded image and no detected figure are left
+       with no image, rather than being screenshotted whole.
 
     Returns:
         dict mapping (page_idx, img_idx) -> PNG image bytes
@@ -343,7 +507,7 @@ def extract_images_from_pdf(pdf_path: str) -> dict:
                 # also try to crop vector figures on it.
                 continue
 
-            # --- No embedded raster: crop captioned vector figures ---
+            # --- No embedded raster: crop vector figures ---
             bboxes = _vector_figure_bboxes(page)
             if bboxes:
                 for bbox in bboxes:
