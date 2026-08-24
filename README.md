@@ -12,6 +12,7 @@ This tool uses the **Claude Opus API (`claude-opus-5`)** to convert any PDF docu
 4. [How to Run](#4-how-to-run)
 5. [Advanced CLI Options](#5-advanced-cli-options)
 6. [Remediation Standards Applied](#6-remediation-standards-applied)
+7. [Project Structure](#7-project-structure)
 
 ---
 
@@ -112,3 +113,23 @@ The document is formatted strictly according to the `pdf-accessibility-remediati
 - **Figure Captions & Alt Text**: Sequential figure numbering (`Figure 1`, `Figure 2`, etc.) with accessibility Alt Text.
 - **Footnotes & Endnotes**: Preserved at the bottom of pages or converted to endnotes according to the source PDF.
 - **Equations**: Every equation/formula is transcribed as LaTeX and rendered as a native, editable Word equation object (not plain text or an image) — standalone equations on their own centered line (with equation numbers right-aligned if present in the source), inline equations rendered in place within the surrounding sentence, list item, table cell, or footnote.
+
+---
+
+## 7. Project Structure
+
+`pdf_to_word.py` at the repo root is a thin entry point (`python pdf_to_word.py ...` still works exactly as before). The implementation lives in the `pdf_accessibility/` package:
+
+| Module | Responsibility |
+|--------|-----------------|
+| `constants.py` | Model name, font settings, bundled stylesheet paths. |
+| `prompts.py` | The Claude system/user prompts driving PDF → JSON extraction. |
+| `pdf_images.py` | Extracts images from the source PDF (PyMuPDF). |
+| `claude_client.py` | Uploads the PDF to Claude and parses the JSON response. |
+| `equations.py` | LaTeX → MathML → OMML conversion for native Word equations. |
+| `rich_text.py` | Hyperlink and inline-equation detection within paragraph text. |
+| `docx_builder.py` | Assembles the structured JSON into the final `.docx`. |
+| `verify.py` | Post-build structural verification report. |
+| `cli.py` | Argument parsing and the `main()` entry point. |
+
+Also runnable as a module: `python -m pdf_accessibility path/to/file.pdf`.
