@@ -27,11 +27,19 @@ import docx
 from docx import Document
 from docx.opc.constants import RELATIONSHIP_TYPE
 from docx.shared import Pt, Inches, Cm, RGBColor
-from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_TAB_ALIGNMENT
 from docx.enum.table import WD_TABLE_ALIGNMENT
 from docx.enum.section import WD_ORIENT
 from docx.oxml.ns import qn, nsdecls
 from docx.oxml import parse_xml
+from lxml import etree
+
+try:
+    import latex2mathml.converter as latex2mathml_converter
+except ImportError:
+    latex2mathml_converter = None
+    print("[WARNING] latex2mathml not installed. Equations will render as plain text.")
+    print("[WARNING] Install it with: pip install latex2mathml")
 
 try:
     import fitz  # PyMuPDF
@@ -47,6 +55,15 @@ MODEL = "claude-opus-5"
 FONT_NAME = "Times New Roman"
 FONT_SIZE = Pt(12)
 MAX_TOKENS = 128_000  # Claude Opus 5 supports large output
+
+# Microsoft's official MathML -> OMML stylesheet, bundled locally so equation
+# rendering doesn't depend on Office being installed on the machine running
+# this script.
+MML2OMML_XSL_CANDIDATES = [
+    Path(__file__).resolve().parent / "resources" / "MML2OMML.XSL",
+    Path(r"C:\Program Files\Microsoft Office\root\Office16\MML2OMML.XSL"),
+    Path(r"C:\Program Files (x86)\Microsoft Office\root\Office16\MML2OMML.XSL"),
+]
 
 # The skill content is embedded as the system prompt
 SYSTEM_PROMPT = r"""
@@ -84,6 +101,15 @@ For each physical PDF page, in order:
   in the source. Don't invent captions for decorative images.
 - Alt text: every meaningful image gets descriptive alt text. Decorative images
   get empty alt.
+
+### Equations
+Every mathematical equation or formula MUST be transcribed as LaTeX and
+rendered as a real, editable math object — never as plain text, Unicode math
+approximations, or a screenshot/image. Standalone/display equations (on
+their own line, e.g. numbered formulas) use the "equation" element type.
+Equations that appear inline within a sentence, list item, table cell, or
+footnote are written inline in that element's "text" field wrapped in single
+dollar signs, e.g. "the area is given by $A = \pi r^2$ for a circle."
 
 ### Footnotes and endnotes
 Match the source's own choice:
@@ -138,6 +164,11 @@ after the JSON. The JSON structure is:
           "description": "Detailed visual description of the figure"
         },
         {
+          "type": "equation",
+          "text": "x = \\frac{-b \\pm \\sqrt{b^2 - 4ac}}{2a}",
+          "label": "(1)"
+        },
+        {
           "type": "footnote",
           "marker": "1",
           "text": "Footnote text"
@@ -179,6 +210,12 @@ Rules for the JSON output:
     - UNORDERED (BULLETED) LISTS: When items in the source PDF begin with a bullet symbol (e.g. •, -, ◦, ▪, ★), you MUST set "ordered": false. NEVER convert bulleted items into numbers (1., 2., etc.).
     - ORDERED (NUMBERED) LISTS: When items in the source PDF begin with numbers or letters (e.g. 1., 2., 3., a., b., (1), (a), i., ii.), you MUST set "ordered": true. NEVER convert numbered items into bullet points.
     - NUMBERING SEQUENCE: Each distinct section or group of items in the PDF is an independent list. Ensure numbered lists restart fresh at 1 for each new section as presented in the PDF.
+15. EQUATIONS (CRITICAL REQUIREMENT):
+    - Every mathematical equation, formula, or symbolic expression MUST be transcribed as valid LaTeX. Never leave math as plain text, Unicode approximations (e.g. "x² + y²"), or an image placeholder.
+    - A standalone/display equation on its own line (commonly numbered) is its own "equation" element, with "text" holding the LaTeX (no surrounding $ delimiters) and, if the source shows an equation number (e.g. "(1)", "(3.2)"), that number goes in "label".
+    - An equation that appears inline within a sentence, list item, table cell, or footnote stays inside that element's normal "text" field, wrapped in single dollar signs, e.g. "the identity $e^{i\pi} + 1 = 0$ shows...".
+    - Escape backslashes correctly for JSON: a LaTeX command like \frac must appear in the JSON string as \\frac.
+    - Transcribe exactly what the source shows (same variables, exponents, subscripts, symbols) — this is remediation, not derivation or simplification.
 </output_format>
 """
 
@@ -193,6 +230,7 @@ Do all these steps precisely:
 - If figures have captions, add figure captions with sequential Figure numbers (Figure 1, Figure 2, etc.).
 - Provide appropriate Alt Text for all meaningful images.
 - Handle footnotes/endnotes as they appear in the source PDF.
+- Transcribe every equation and formula as LaTeX so it renders as a real Word equation, not plain text: standalone/display equations as their own "equation" element, inline equations wrapped in single dollar signs within the surrounding text (e.g. "$A = \\pi r^2$"). Escape backslashes for JSON (\\frac, \\pi, \\sqrt, etc.).
 - Identify any URLs or web links in the PDF text and preserve/format them so they become active clickable hyperlinks in the output Word document.
 - STRICT LIST FIDELITY: Inspect the PDF carefully for list formatting:
   * If the PDF shows bullet symbols (•, -, ▪), format strictly as UNORDERED bullet list ("ordered": false). Do NOT convert bullets to numbers.
@@ -426,8 +464,109 @@ def extract_json(text: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Word document builder
+# Equation rendering (LaTeX -> MathML -> native Word OMML equations)
 # ---------------------------------------------------------------------------
+
+_omml_transform = None
+_omml_transform_loaded = False
+
+
+def _get_omml_transform():
+    """Lazily load and cache the MathML -> OMML XSLT transform."""
+    global _omml_transform, _omml_transform_loaded
+    if _omml_transform_loaded:
+        return _omml_transform
+    _omml_transform_loaded = True
+
+    xsl_path = next((p for p in MML2OMML_XSL_CANDIDATES if p.exists()), None)
+    if xsl_path is None:
+        print("[WARNING] MML2OMML.XSL not found. Equations will render as plain text.")
+        return None
+
+    try:
+        xslt_doc = etree.parse(str(xsl_path))
+        _omml_transform = etree.XSLT(xslt_doc)
+    except Exception as e:
+        print(f"[WARNING] Could not load MathML->OMML stylesheet: {e}")
+        _omml_transform = None
+
+    return _omml_transform
+
+
+def latex_to_omml(latex_str: str):
+    """Convert a LaTeX equation string to an <m:oMath> lxml element.
+
+    Returns None if conversion isn't possible (missing deps/stylesheet, or
+    the LaTeX couldn't be parsed) so callers can fall back to plain text.
+    """
+    latex_str = (latex_str or "").strip()
+    if not latex_str or latex2mathml_converter is None:
+        return None
+
+    transform = _get_omml_transform()
+    if transform is None:
+        return None
+
+    try:
+        mathml_str = latex2mathml_converter.convert(latex_str)
+        mathml_doc = etree.fromstring(mathml_str.encode("utf-8"))
+        omml_doc = transform(mathml_doc)
+        return omml_doc.getroot()
+    except Exception as e:
+        print(f"  [WARNING] Failed to convert equation to OMML ('{latex_str}'): {e}")
+        return None
+
+
+def _add_plain_text_equation_fallback(paragraph, latex_str):
+    """Fallback when LaTeX->OMML conversion fails: show the raw LaTeX as italic text."""
+    run = paragraph.add_run(latex_str)
+    run.font.name = FONT_NAME
+    run.font.size = FONT_SIZE
+    run.font.italic = True
+
+
+def insert_inline_equation(paragraph, latex_str):
+    """Insert an equation as a native Word math run inline within a paragraph."""
+    omml = latex_to_omml(latex_str)
+    if omml is not None:
+        paragraph._p.append(omml)
+    else:
+        _add_plain_text_equation_fallback(paragraph, latex_str)
+
+
+def insert_display_equation(doc, latex_str, label=None):
+    """Add a standalone display equation as its own paragraph.
+
+    With no label, the equation is simply centered. With a `label` (e.g. an
+    equation number like "(1)"), the equation is centered via a center tab
+    stop and the label is pushed to the right margin via a right tab stop —
+    the standard textbook layout for numbered equations.
+    """
+    para = doc.add_paragraph()
+    omml = latex_to_omml(latex_str)
+    usable_width = doc.sections[-1].page_width - doc.sections[-1].left_margin - doc.sections[-1].right_margin
+
+    if label:
+        para.paragraph_format.tab_stops.add_tab_stop(usable_width // 2, WD_TAB_ALIGNMENT.CENTER)
+        para.paragraph_format.tab_stops.add_tab_stop(usable_width, WD_TAB_ALIGNMENT.RIGHT)
+        para.add_run("\t")
+    else:
+        para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    if omml is not None:
+        omath_para = etree.Element(qn("m:oMathPara"))
+        omath_para.append(omml)
+        para._p.append(omath_para)
+    else:
+        _add_plain_text_equation_fallback(para, latex_str)
+
+    if label:
+        label_run = para.add_run(f"\t{label}")
+        label_run.font.name = FONT_NAME
+        label_run.font.size = FONT_SIZE
+
+    return para
+
 
 def add_hyperlink(paragraph, url, text, font_name=FONT_NAME, font_size_pt=12,
                   color="0002D0", underline=True, bold=False, italic=False):
@@ -465,13 +604,20 @@ def add_hyperlink(paragraph, url, text, font_name=FONT_NAME, font_size_pt=12,
 
 
 def add_formatted_text(paragraph, text, bold=False, italic=False):
-    """Add text to a paragraph, automatically detecting markdown links [text](url)
-    and raw URLs (http://, https://, www., mailto:), inserting native Word hyperlinks."""
+    """Add text to a paragraph, automatically detecting markdown links [text](url),
+    raw URLs (http://, https://, www., mailto:), and inline LaTeX equations
+    ($...$), inserting native Word hyperlinks and equations respectively."""
     if not text:
         return
 
-    # Pattern matches markdown links `[display text](url)` OR raw URLs `https://...`, `http://...`, `www....`, `mailto:...`
-    pattern = r'(\[(?P<md_text>[^\]]+)\]\((?P<md_url>https?://[^\s)]+|www\.[^\s)]+|mailto:[^\s)]+)\))|(?P<raw_url>https?://[^\s)]+|www\.[^\s)]+|mailto:[^\s)]+)'
+    # Pattern matches markdown links `[display text](url)`, raw URLs
+    # `https://...`, `http://...`, `www....`, `mailto:...`, or inline LaTeX
+    # equations delimited by single dollar signs `$...$`.
+    pattern = (
+        r'(\[(?P<md_text>[^\]]+)\]\((?P<md_url>https?://[^\s)]+|www\.[^\s)]+|mailto:[^\s)]+)\))'
+        r'|(?P<raw_url>https?://[^\s)]+|www\.[^\s)]+|mailto:[^\s)]+)'
+        r'|\$(?P<equation>[^\s$](?:[^$]*[^\s$])?)\$'
+    )
 
     last_idx = 0
     for match in re.finditer(pattern, text):
@@ -485,6 +631,12 @@ def add_formatted_text(paragraph, text, bold=False, italic=False):
             run.font.bold = bold
             run.font.italic = italic
             run._element.get_or_add_rPr().get_or_add_rFonts().set(qn("w:eastAsia"), FONT_NAME)
+
+        equation = match.group("equation")
+        if equation:
+            insert_inline_equation(paragraph, equation)
+            last_idx = end
+            continue
 
         # Handle hyperlink match
         md_text = match.group("md_text")
@@ -863,6 +1015,13 @@ def build_docx(data: dict, output_path: str, extracted_images: dict = None):
                 )
                 cap_para.paragraph_format.space_before = Pt(4)
                 cap_para.paragraph_format.space_after = Pt(8)
+
+            elif elem_type == "equation":
+                current_list_type = None
+                current_ordered_num_id = None
+                latex_text = elem.get("text", "")
+                label = elem.get("label", None)
+                insert_display_equation(doc, latex_text, label=label)
 
             elif elem_type == "footnote":
                 marker = elem.get("marker", "")

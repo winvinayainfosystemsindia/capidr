@@ -27,6 +27,8 @@ Run the following command in your terminal/command prompt to install all depende
 pip install -r requirements.txt
 ```
 
+Equation rendering (LaTeX → native Word equations) uses the `resources/MML2OMML.XSL` stylesheet bundled in this repo — keep the `resources/` folder alongside `pdf_to_word.py`.
+
 ---
 
 ## 2. API Key Configuration
@@ -109,3 +111,4 @@ The document is formatted strictly according to the `pdf-accessibility-remediati
 - **Tables**: Formatted as real Word tables with header rows marked and **no merged cells**.
 - **Figure Captions & Alt Text**: Sequential figure numbering (`Figure 1`, `Figure 2`, etc.) with accessibility Alt Text.
 - **Footnotes & Endnotes**: Preserved at the bottom of pages or converted to endnotes according to the source PDF.
+- **Equations**: Every equation/formula is transcribed as LaTeX and rendered as a native, editable Word equation object (not plain text or an image) — standalone equations on their own centered line (with equation numbers right-aligned if present in the source), inline equations rendered in place within the surrounding sentence, list item, table cell, or footnote.
