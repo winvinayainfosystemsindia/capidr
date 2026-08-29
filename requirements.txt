@@ -4,3 +4,4 @@ Pillow>=10.0.0
 PyMuPDF>=1.25.0
 latex2mathml>=3.77.0
 lxml>=5.0.0
+openpyxl>=3.1.0

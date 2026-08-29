@@ -1,0 +1,1 @@
+"""Headings & Styles checkers."""

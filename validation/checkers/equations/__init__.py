@@ -1,0 +1,1 @@
+"""Equations (STEM-specific) checkers."""

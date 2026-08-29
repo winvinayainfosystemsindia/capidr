@@ -1,0 +1,1 @@
+"""Images & Graphics checkers."""
