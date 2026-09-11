@@ -8,11 +8,12 @@ This tool uses the **Claude Opus API (`claude-opus-5`)** to convert any PDF docu
 
 1. [Prerequisites & Installation](#1-prerequisites--installation)
 2. [API Key Configuration](#2-api-key-configuration)
-3. [Input & Output File Locations](#3-input--output-file-locations)
-4. [How to Run](#4-how-to-run)
-5. [Advanced CLI Options](#5-advanced-cli-options)
-6. [Remediation Standards Applied](#6-remediation-standards-applied)
-7. [Project Structure](#7-project-structure)
+3. [AWS Textract Setup (Figure Detection)](#3-aws-textract-setup-figure-detection)
+4. [Input & Output File Locations](#4-input--output-file-locations)
+5. [How to Run](#5-how-to-run)
+6. [Advanced CLI Options](#6-advanced-cli-options)
+7. [Remediation Standards Applied](#7-remediation-standards-applied)
+8. [Project Structure](#8-project-structure)
 
 ---
 
@@ -32,7 +33,7 @@ Equation rendering (LaTeX → native Word equations) uses the `resources/MML2OMM
 
 ---
 
-## 2. API Key Configuration
+## 2. API Key Configuration (Anthropic)
 
 You need an **Anthropic API key** to run the Claude Opus model.
 
@@ -58,7 +59,41 @@ You can pass the API key directly using the `--api-key` flag when executing the 
 
 ---
 
-## 3. Input & Output File Locations
+## 3. AWS Textract Setup (Figure Detection)
+
+Figure/image detection in PDFs uses **AWS Textract's AnalyzeDocument API** with the `LAYOUT` feature. This requires an AWS account with Textract permissions.
+
+### Step 1: Create an IAM User
+1. Go to [AWS IAM Console](https://console.aws.amazon.com/iam/) → **Users** → **Create User**
+2. Name it (e.g., `textract-user`)
+3. Attach the managed policy: **`AmazonTextractFullAccess`**
+4. Under **Security credentials** → **Create access key** → choose **"Application running outside AWS"**
+5. Save the **Access Key ID** and **Secret Access Key**
+
+### Step 2: Configure Credentials
+
+Add these to your `.env` file (or set as environment variables):
+
+```env
+AWS_ACCESS_KEY_ID=AKIA...
+AWS_SECRET_ACCESS_KEY=wJal...
+AWS_REGION=us-east-1
+```
+
+Alternatively, configure via the AWS CLI:
+```bash
+pip install awscli
+aws configure
+```
+
+### Cost
+Textract AnalyzeDocument with LAYOUT costs approximately **$0.015 per page**.
+
+> **Note:** If AWS credentials are not configured, the tool will still work — it simply skips Textract-based figure detection and only extracts embedded raster images.
+
+---
+
+## 4. Input & Output File Locations
 
 ### Input File Location
 - Place your PDF file anywhere on your system or inside the project folder (e.g. `c:\External-projects\WinVinaya\capidr\sample.pdf`).
@@ -71,7 +106,7 @@ You can pass the API key directly using the `--api-key` flag when executing the 
 
 ---
 
-## 4. How to Run
+## 5. How to Run
 
 ### Basic Conversion (Default Output Path)
 ```bash
@@ -90,7 +125,7 @@ python pdf_to_word.py sample.pdf --api-key sk-ant-your-api-key-here
 
 ---
 
-## 5. Advanced CLI Options
+## 6. Advanced CLI Options
 
 | Flag | Description | Example |
 |------|-------------|---------|
@@ -101,7 +136,7 @@ python pdf_to_word.py sample.pdf --api-key sk-ant-your-api-key-here
 
 ---
 
-## 6. Remediation Standards Applied
+## 7. Remediation Standards Applied
 
 The document is formatted strictly according to the `pdf-accessibility-remediation` specification:
 
@@ -116,7 +151,7 @@ The document is formatted strictly according to the `pdf-accessibility-remediati
 
 ---
 
-## 7. Project Structure
+## 8. Project Structure
 
 `pdf_to_word.py` at the repo root is a thin entry point (`python pdf_to_word.py ...` still works exactly as before). The implementation lives in the `pdf_accessibility/` package:
 
@@ -124,7 +159,7 @@ The document is formatted strictly according to the `pdf-accessibility-remediati
 |--------|-----------------|
 | `constants.py` | Model name, font settings, bundled stylesheet paths. |
 | `prompts.py` | The Claude system/user prompts driving PDF → JSON extraction. |
-| `pdf_images.py` | Extracts images from the source PDF (PyMuPDF). |
+| `pdf_images.py` | Extracts images from the source PDF (embedded rasters via PyMuPDF, figures via AWS Textract). |
 | `claude_client.py` | Uploads the PDF to Claude and parses the JSON response. |
 | `equations.py` | LaTeX → MathML → OMML conversion for native Word equations. |
 | `rich_text.py` | Hyperlink and inline-equation detection within paragraph text. |
