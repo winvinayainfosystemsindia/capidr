@@ -1,7 +1,13 @@
 """Assembles the structured JSON produced by Claude into a .docx file."""
 
 import io
+from pathlib import Path
 import re
+
+try:
+    from PIL import Image as PILImage
+except ImportError:
+    PILImage = None
 
 from docx import Document
 from docx.enum.table import WD_TABLE_ALIGNMENT
@@ -377,6 +383,9 @@ def build_docx(data: dict, output_path: str, extracted_images: dict = None):
         # Collect footnotes for this page
         page_footnotes = []
 
+        # Track images used on this page to prevent duplicate insertion and ensure clean sequential fallback
+        used_image_indices_on_page = set()
+
         # Process each element on the page
         elements = page.get("elements", [])
         for elem in elements:
@@ -450,73 +459,86 @@ def build_docx(data: dict, output_path: str, extracted_images: dict = None):
                 caption = elem.get("caption", "")
                 alt_text = elem.get("alt_text", "")
                 description = elem.get("description", "")
-                image_index = elem.get("image_index", 0)
+                raw_image_index = elem.get("image_index")
 
-                # Determine caption text
-                if caption:
-                    cap_text = caption
-                else:
-                    cap_text = f"Figure {fig_num}" if fig_num else "Figure"
+                # Find all available image indices for this page
+                available_indices = sorted([k[1] for k in extracted_images if k[0] == page_idx])
 
-                # Try to insert actual image from extracted images
-                image_key = (page_idx, image_index)
+                # Determine target image index on this page
+                target_idx = None
+                if raw_image_index is not None and isinstance(raw_image_index, int):
+                    if (page_idx, raw_image_index) in extracted_images and raw_image_index not in used_image_indices_on_page:
+                        target_idx = raw_image_index
+
+                if target_idx is None:
+                    # Take the first unused image on this page
+                    unused = [idx for idx in available_indices if idx not in used_image_indices_on_page]
+                    if unused:
+                        target_idx = unused[0]
+
                 image_inserted = False
-
-                # Graceful fallback: if exact index not found, check available images on this page
-                if image_key not in extracted_images:
-                    page_images = sorted([k for k in extracted_images if k[0] == page_idx], key=lambda k: k[1])
-                    if len(page_images) == 1:
-                        image_key = page_images[0]
-                    elif len(page_images) > 0 and image_index < len(page_images):
-                        image_key = page_images[image_index]
-
-                if image_key in extracted_images:
+                if target_idx is not None and (page_idx, target_idx) in extracted_images:
+                    image_key = (page_idx, target_idx)
+                    used_image_indices_on_page.add(target_idx)
                     try:
                         img_bytes = extracted_images[image_key]
                         img_stream = io.BytesIO(img_bytes)
                         img_para = doc.add_paragraph()
                         img_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
                         run = img_para.add_run()
-                        inline_shape = run.add_picture(img_stream, width=Inches(5.5))
+
+                        # Determine natural display width based on image pixel dimensions at 200 DPI
+                        img_width = Inches(5.0)
+                        try:
+                            if PILImage:
+                                pil_im = PILImage.open(io.BytesIO(img_bytes))
+                                natural_width = pil_im.width / 200.0
+                                img_width = min(Inches(5.5), Inches(max(1.5, natural_width)))
+                        except Exception:
+                            pass
+
+                        inline_shape = run.add_picture(img_stream, width=img_width)
 
                         # Set alt text on the image for accessibility
                         inline = inline_shape._inline
-                        # docPr element holds the alt text
                         doc_pr = inline.find(qn('wp:docPr'))
                         if doc_pr is None:
                             doc_pr = inline.find('.//' + qn('wp:docPr'))
                         if doc_pr is not None:
-                            effective_alt = alt_text if alt_text else (description if description else cap_text)
+                            effective_alt = alt_text if alt_text else (description if description else (caption if caption else "Figure"))
                             doc_pr.set('descr', effective_alt)
-                            doc_pr.set('title', cap_text)
+                            if caption or fig_num:
+                                doc_pr.set('title', caption if caption else f"Figure {fig_num}")
 
                         image_inserted = True
-                        print(f"  [IMG] Inserted image for page {page_label}, image {image_index}")
+                        print(f"  [IMG] Inserted image for page {page_label}, image {target_idx}")
                     except Exception as e:
                         err_detail = str(e) if str(e) else type(e).__name__
-                        print(f"  [WARNING] Failed to insert image (page {page_label}, idx {image_index}): {err_detail}")
+                        print(f"  [WARNING] Failed to insert image (page {page_label}, idx {target_idx}): {err_detail}")
 
                 if not image_inserted:
-                    # Fallback: add text placeholder
+                    cap_label = caption if caption else (f"Figure {fig_num}" if fig_num else "Figure")
                     fig_para = add_paragraph_with_font(
                         doc,
-                        f"[{cap_text} — image not available]",
+                        f"[{cap_label} — image not available]",
                         italic=True,
                         alignment=WD_ALIGN_PARAGRAPH.CENTER,
                         lang_code=lang_code,
                     )
 
-                # Add caption below image
-                cap_para = add_paragraph_with_font(
-                    doc,
-                    cap_text,
-                    bold=True,
-                    italic=True,
-                    alignment=WD_ALIGN_PARAGRAPH.CENTER,
-                    lang_code=lang_code,
-                )
-                cap_para.paragraph_format.space_before = Pt(4)
-                cap_para.paragraph_format.space_after = Pt(8)
+                # Only add caption below image if caption or figure_number is explicitly provided
+                if caption or fig_num:
+                    cap_text = caption if caption else f"Figure {fig_num}"
+                    cap_para = add_paragraph_with_font(
+                        doc,
+                        cap_text,
+                        bold=True,
+                        italic=True,
+                        alignment=WD_ALIGN_PARAGRAPH.CENTER,
+                        lang_code=lang_code,
+                    )
+                    cap_para.paragraph_format.space_before = Pt(4)
+                    cap_para.paragraph_format.space_after = Pt(8)
 
             elif elem_type == "equation":
                 current_list_type = None
@@ -598,5 +620,12 @@ def build_docx(data: dict, output_path: str, extracted_images: dict = None):
     # -----------------------------------------------------------------------
     # Save
     # -----------------------------------------------------------------------
-    doc.save(output_path)
-    print(f"[SUCCESS] Word document saved to: {output_path}")
+    try:
+        doc.save(output_path)
+        print(f"[SUCCESS] Word document saved to: {output_path}")
+    except PermissionError:
+        p = Path(output_path)
+        alt_path = str(p.with_name(f"{p.stem}_updated{p.suffix}"))
+        print(f"[WARNING] Could not overwrite '{output_path}' because it is open in Microsoft Word.")
+        doc.save(alt_path)
+        print(f"[SUCCESS] Saved updated Word document to: {alt_path}")

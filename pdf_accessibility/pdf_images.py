@@ -113,9 +113,110 @@ def _detect_figures_with_textract(client, page_image_bytes):
             if bbox:
                 bboxes.append(bbox)
 
-    # Sort bounding boxes in visual reading order (top-to-bottom, left-to-right)
-    bboxes.sort(key=lambda b: (b.get("Top", 0), b.get("Left", 0)))
     return bboxes
+
+
+def _is_meaningful_figure(bbox, page_w, page_h):
+    """Filter out non-content page elements detected by Textract as LAYOUT_FIGURE:
+    - Running headers, page numbers, decorative footer ornaments
+    - Tiny UI icons, bullets, and section heading banners
+    - Extreme bottom or margin lines
+    """
+    top = bbox.get("Top", 0)
+    left = bbox.get("Left", 0)
+    w = bbox.get("Width", 0)
+    h = bbox.get("Height", 0)
+    w_px = w * page_w
+    h_px = h * page_h
+    area_px = w_px * h_px
+
+    # 1. Header / footer / corner margin furniture
+    if top < 0.10 and h < 0.08:
+        return False
+    if top > 0.85 and (left < 0.15 or (left + w) > 0.85) and h < 0.10:
+        return False
+    if top > 0.95:
+        return False
+
+    # 2. Tiny decorative icons, bullets, and thin section heading banners
+    if w_px < 140 and h_px < 140:
+        return False
+    if h_px < 98:
+        return False
+    if area_px < 25000 and (w_px < 160 or h_px < 160):
+        return False
+
+    return True
+
+
+def _merge_adjacent_bboxes(bboxes, x_gap_tolerance=0.005, y_overlap_threshold=0.7):
+    """Merge adjacent bounding boxes that belong to the same composite figure
+    (e.g., Textract splitting a horizontal screenshot into adjacent tiles).
+    """
+    if len(bboxes) < 2:
+        return bboxes
+    changed = True
+    merged = list(bboxes)
+    while changed:
+        changed = False
+        new_merged = []
+        skip_indices = set()
+        for i in range(len(merged)):
+            if i in skip_indices:
+                continue
+            merged_b = dict(merged[i])
+            for j in range(i + 1, len(merged)):
+                if j in skip_indices:
+                    continue
+                b2 = merged[j]
+                top1, bottom1 = merged_b["Top"], merged_b["Top"] + merged_b["Height"]
+                top2, bottom2 = b2["Top"], b2["Top"] + b2["Height"]
+                overlap_y = max(0, min(bottom1, bottom2) - max(top1, top2))
+                min_h = min(merged_b["Height"], b2["Height"])
+                if min_h > 0 and (overlap_y / min_h) >= y_overlap_threshold:
+                    left1, right1 = merged_b["Left"], merged_b["Left"] + merged_b["Width"]
+                    left2, right2 = b2["Left"], b2["Left"] + b2["Width"]
+                    gap_x = max(0, max(left1, left2) - min(right1, right2))
+                    if gap_x <= x_gap_tolerance:
+                        new_left = min(left1, left2)
+                        new_top = min(top1, top2)
+                        new_right = max(right1, right2)
+                        new_bottom = max(bottom1, bottom2)
+                        merged_b["Left"] = new_left
+                        merged_b["Top"] = new_top
+                        merged_b["Width"] = new_right - new_left
+                        merged_b["Height"] = new_bottom - new_top
+                        skip_indices.add(j)
+                        changed = True
+            new_merged.append(merged_b)
+        merged = new_merged
+    return merged
+
+
+def _sort_figures_reading_order(bboxes, y_tolerance=0.04):
+    """Sort bounding boxes in visual reading order:
+    groups bboxes into horizontal rows (within y_tolerance) and sorts each row
+    left-to-right, then sequences the rows top-to-bottom.
+    """
+    if not bboxes:
+        return []
+    sorted_by_top = sorted(bboxes, key=lambda b: b.get("Top", 0))
+    rows = []
+    current_row = [sorted_by_top[0]]
+    current_row_y = sorted_by_top[0].get("Top", 0)
+    for b in sorted_by_top[1:]:
+        top = b.get("Top", 0)
+        if abs(top - current_row_y) <= y_tolerance:
+            current_row.append(b)
+        else:
+            current_row.sort(key=lambda x: x.get("Left", 0))
+            rows.extend(current_row)
+            current_row = [b]
+            current_row_y = top
+    if current_row:
+        current_row.sort(key=lambda x: x.get("Left", 0))
+        rows.extend(current_row)
+    return rows
 
 
 def _crop_figure(page_pil_image, bbox, padding=CROP_PADDING_PX):
@@ -218,7 +319,17 @@ def extract_images_from_pdf(pdf_path: str) -> dict:
                 )
 
                 if figure_bboxes:
-                    for bbox in figure_bboxes:
+                    # Filter out page furniture, margin decorations, tiny icons, and heading banners
+                    meaningful_bboxes = [
+                        b for b in figure_bboxes
+                        if _is_meaningful_figure(b, page_pil.width, page_pil.height)
+                    ]
+                    # Merge split diagram parts (e.g. adjacent screenshots split by Textract)
+                    merged_bboxes = _merge_adjacent_bboxes(meaningful_bboxes)
+                    # Sort in visual reading order (rows top-to-bottom, columns left-to-right)
+                    ordered_bboxes = _sort_figures_reading_order(merged_bboxes)
+
+                    for bbox in ordered_bboxes:
                         figure_png = _crop_figure(page_pil, bbox)
                         if figure_png is not None:
                             extracted[(page_idx, img_on_page)] = figure_png
@@ -268,9 +379,22 @@ def extract_images_from_pdf(pdf_path: str) -> dict:
                     print(f"  [WARNING] Could not extract embedded image from page {page_idx + 1}: {e}")
 
             if candidate_images:
-                # Sort embedded images in reading order (top-to-bottom, left-to-right)
-                candidate_images.sort(key=lambda x: (x[0], x[1]))
-                for _, _, img_bytes in candidate_images:
+                # Sort embedded images in reading order (rows top-to-bottom, columns left-to-right)
+                candidate_images.sort(key=lambda x: x[0])
+                sorted_embedded = []
+                current_row = [candidate_images[0]]
+                for item in candidate_images[1:]:
+                    if abs(item[0] - current_row[0][0]) <= 30:  # ~30pt row tolerance
+                        current_row.append(item)
+                    else:
+                        current_row.sort(key=lambda x: x[1])
+                        sorted_embedded.extend(current_row)
+                        current_row = [item]
+                if current_row:
+                    current_row.sort(key=lambda x: x[1])
+                    sorted_embedded.extend(current_row)
+
+                for _, _, img_bytes in sorted_embedded:
                     extracted[(page_idx, img_on_page)] = img_bytes
                     img_on_page += 1
                     embedded_count += 1
