@@ -61,6 +61,7 @@ after the JSON. The JSON structure is:
 
 {
   "title": "Document Title",
+  "language": "en-US",
   "pages": [
     {
       "page_label": "1",
@@ -145,12 +146,18 @@ Rules for the JSON output:
     - UNORDERED (BULLETED) LISTS: When items in the source PDF begin with a bullet symbol (e.g. •, -, ◦, ▪, ★), you MUST set "ordered": false. NEVER convert bulleted items into numbers (1., 2., etc.).
     - ORDERED (NUMBERED) LISTS: When items in the source PDF begin with numbers or letters (e.g. 1., 2., 3., a., b., (1), (a), i., ii.), you MUST set "ordered": true. NEVER convert numbered items into bullet points.
     - NUMBERING SEQUENCE: Each distinct section or group of items in the PDF is an independent list. Ensure numbered lists restart fresh at 1 for each new section as presented in the PDF.
-15. EQUATIONS (CRITICAL REQUIREMENT):
+15. EQUATIONS & TRIGONOMETRIC RATIOS (CRITICAL REQUIREMENT):
     - Every mathematical equation, formula, or symbolic expression MUST be transcribed as valid LaTeX. Never leave math as plain text, Unicode approximations (e.g. "x² + y²"), or an image placeholder.
+    - TRIGONOMETRIC OPERATORS: Always use standard built-in LaTeX operators: `\\sin`, `\\cos`, `\\tan`, `\\csc`, `\\sec`, `\\cot`.
+      * NEVER transcribe cosecant as `cosec` or `\\cosec` — ALWAYS use the standard built-in trigonometric operator `\\csc` (e.g., `\\csc \\theta`, `\\csc 30^\\circ`, `\\csc^2 A`).
+      * In surrounding plain text, always write `csc` instead of `cosec`.
+    - DEGREE SYMBOLS: For angles and measurements with degrees, always transcribe using LaTeX `^\\circ` (e.g. `$30^\\circ$`, `$45^\\circ$`, `$60^\\circ$`, `$90^\\circ$`, `$20^\\circ$`) or unicode `°` (`30°`).
+      * NEVER transcribe degrees as a generic superscript letter 'o' (`30^o`) or upper circle.
     - A standalone/display equation on its own line (commonly numbered) is its own "equation" element, with "text" holding the LaTeX (no surrounding $ delimiters) and, if the source shows an equation number (e.g. "(1)", "(3.2)"), that number goes in "label".
-    - An equation that appears inline within a sentence, list item, table cell, or footnote stays inside that element's normal "text" field, wrapped in single dollar signs, e.g. "the identity $e^{i\pi} + 1 = 0$ shows...".
-    - Escape backslashes correctly for JSON: a LaTeX command like \frac must appear in the JSON string as \\frac.
+    - An equation that appears inline within a sentence, list item, table cell, or footnote stays inside that element's normal "text" field, wrapped in single dollar signs, e.g. "the identity $\\csc^2 \\theta - \\cot^2 \\theta = 1$ shows...".
+    - Escape backslashes correctly for JSON: a LaTeX command like \\frac must appear in the JSON string as \\\\frac, \\csc as \\\\csc.
     - Transcribe exactly what the source shows (same variables, exponents, subscripts, symbols) — this is remediation, not derivation or simplification.
+16. DOCUMENT PROOFING LANGUAGE: Detect and set the document's primary BCP-47 language tag in the root 'language' field (e.g. 'ta-IN' for Tamil, 'hi-IN' for Hindi, 'te-IN' for Telugu, 'kn-IN' for Kannada, 'ml-IN' for Malayalam, 'bn-IN' for Bengali, 'en-US' for English, 'es-ES' for Spanish, 'fr-FR' for French, 'de-DE' for German, etc.).
 </output_format>
 """
 
@@ -159,6 +166,7 @@ following the output_format specification in your instructions.
 
 Do all these steps precisely:
 - Convert ALL content from the PDF — do not skip, summarize, or change any content.
+- Identify and set the primary BCP-47 language tag of the document in 'language' (e.g. 'ta-IN', 'hi-IN', 'en-US').
 - For each PDF page, create a page entry with the correct page_label.
 - Format content headings as Heading 2, 3, and 4 based on the source hierarchy.
 - Include and properly format all tables (without merged cells).
@@ -166,6 +174,8 @@ Do all these steps precisely:
 - Provide appropriate Alt Text for all meaningful images.
 - Handle footnotes/endnotes as they appear in the source PDF.
 - Transcribe every equation and formula as LaTeX so it renders as a real Word equation, not plain text: standalone/display equations as their own "equation" element, inline equations wrapped in single dollar signs within the surrounding text (e.g. "$A = \\pi r^2$"). Escape backslashes for JSON (\\frac, \\pi, \\sqrt, etc.).
+- TRIGONOMETRIC RATIOS: Use standard built-in math operators: \\sin, \\cos, \\tan, \\csc, \\sec, \\cot. Convert any occurrence of 'cosec' to the built-in trigonometric operator '\\csc' in math and 'csc' in text.
+- DEGREE ANGLES: Transcribe degree symbols as '^\\circ' in LaTeX (e.g. '$30^\\circ$', '$45^\\circ$') or '°' in text. Never use superscript letter 'o' ('30^o').
 - Identify any URLs or web links in the PDF text and preserve/format them so they become active clickable hyperlinks in the output Word document.
 - STRICT LIST FIDELITY: Inspect the PDF carefully for list formatting:
   * If the PDF shows bullet symbols (•, -, ▪), format strictly as UNORDERED bullet list ("ordered": false). Do NOT convert bullets to numbers.

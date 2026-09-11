@@ -16,9 +16,27 @@ from .constants import FONT_NAME, FONT_SIZE
 from .equations import insert_inline_equation
 
 
+def apply_run_lang_and_font(run, lang_code=None, font_name=FONT_NAME):
+    """Set font family and proofing language on a run's rPr element."""
+    rpr = run._element.get_or_add_rPr()
+    rfonts = rpr.get_or_add_rFonts()
+    rfonts.set(qn("w:ascii"), font_name)
+    rfonts.set(qn("w:hAnsi"), font_name)
+    rfonts.set(qn("w:cs"), font_name)
+    rfonts.set(qn("w:eastAsia"), font_name)
+    if lang_code:
+        for old_lang in rpr.findall(qn("w:lang")):
+            rpr.remove(old_lang)
+        lang_elem = parse_xml(
+            f'<w:lang {nsdecls("w")} w:val="{lang_code}" w:eastAsia="{lang_code}" w:bidi="{lang_code}"/>'
+        )
+        rpr.append(lang_elem)
+
+
 def add_hyperlink(paragraph, url, text, font_name=FONT_NAME, font_size_pt=12,
-                  color="0002D0", underline=True, bold=False, italic=False):
-    """Add an active, clickable Word hyperlink to a paragraph."""
+                  color="0002D0", underline=True, bold=False, italic=False,
+                  lang_code=None):
+    """Add an active, clickable Word hyperlink to a paragraph with proofing language."""
     target_url = url
     if not target_url.startswith(("http://", "https://", "mailto:", "ftp://")):
         target_url = "https://" + target_url
@@ -30,9 +48,12 @@ def add_hyperlink(paragraph, url, text, font_name=FONT_NAME, font_size_pt=12,
     new_run = parse_xml(f'<w:r {nsdecls("w")}/>')
     rPr = parse_xml(f'<w:rPr {nsdecls("w")}/>')
 
-    rPr.append(parse_xml(f'<w:rFonts {nsdecls("w")} w:ascii="{font_name}" w:hAnsi="{font_name}" w:cs="{font_name}"/>'))
+    rPr.append(parse_xml(f'<w:rFonts {nsdecls("w")} w:ascii="{font_name}" w:hAnsi="{font_name}" w:cs="{font_name}" w:eastAsia="{font_name}"/>'))
     sz_val = int(font_size_pt * 2)
     rPr.append(parse_xml(f'<w:sz {nsdecls("w")} w:val="{sz_val}"/>'))
+
+    if lang_code:
+        rPr.append(parse_xml(f'<w:lang {nsdecls("w")} w:val="{lang_code}" w:eastAsia="{lang_code}" w:bidi="{lang_code}"/>'))
 
     if color:
         rPr.append(parse_xml(f'<w:color {nsdecls("w")} w:val="{color}"/>'))
@@ -51,12 +72,16 @@ def add_hyperlink(paragraph, url, text, font_name=FONT_NAME, font_size_pt=12,
     return hyperlink
 
 
-def add_formatted_text(paragraph, text, bold=False, italic=False):
+def add_formatted_text(paragraph, text, bold=False, italic=False, lang_code=None):
     """Add text to a paragraph, automatically detecting markdown links [text](url),
     raw URLs (http://, https://, www., mailto:), and inline LaTeX equations
     ($...$), inserting native Word hyperlinks and equations respectively."""
     if not text:
         return
+
+    # Normalize 'cosec' -> 'csc' in plain text outside equations
+    # and normalize degree symbols like 30^o -> 30°
+    text = re.sub(r'\bcosec\b', 'csc', text)
 
     # Pattern matches markdown links `[display text](url)`, raw URLs
     # `https://...`, `http://...`, `www....`, `mailto:...`, or inline LaTeX
@@ -78,7 +103,7 @@ def add_formatted_text(paragraph, text, bold=False, italic=False):
             run.font.size = FONT_SIZE
             run.font.bold = bold
             run.font.italic = italic
-            run._element.get_or_add_rPr().get_or_add_rFonts().set(qn("w:eastAsia"), FONT_NAME)
+            apply_run_lang_and_font(run, lang_code=lang_code)
 
         equation = match.group("equation")
         if equation:
@@ -98,7 +123,7 @@ def add_formatted_text(paragraph, text, bold=False, italic=False):
             link_text = raw_url
             link_url = raw_url
 
-        add_hyperlink(paragraph, link_url, link_text, bold=bold, italic=italic)
+        add_hyperlink(paragraph, link_url, link_text, bold=bold, italic=italic, lang_code=lang_code)
         last_idx = end
 
     # Add remaining text after last match
@@ -109,4 +134,4 @@ def add_formatted_text(paragraph, text, bold=False, italic=False):
         run.font.size = FONT_SIZE
         run.font.bold = bold
         run.font.italic = italic
-        run._element.get_or_add_rPr().get_or_add_rFonts().set(qn("w:eastAsia"), FONT_NAME)
+        apply_run_lang_and_font(run, lang_code=lang_code)

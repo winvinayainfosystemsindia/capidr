@@ -88,7 +88,8 @@ def _get_textract_client():
 
 def _detect_figures_with_textract(client, page_image_bytes):
     """Call Textract AnalyzeDocument with the LAYOUT feature and return a
-    list of normalised bounding boxes for every LAYOUT_FIGURE block.
+    list of normalised bounding boxes for every LAYOUT_FIGURE block,
+    sorted in reading order (top-to-bottom, left-to-right).
 
     Each bbox is a dict with keys: Width, Height, Left, Top (all 0–1
     fractions of the page image dimensions).
@@ -112,6 +113,8 @@ def _detect_figures_with_textract(client, page_image_bytes):
             if bbox:
                 bboxes.append(bbox)
 
+    # Sort bounding boxes in visual reading order (top-to-bottom, left-to-right)
+    bboxes.sort(key=lambda b: (b.get("Top", 0), b.get("Left", 0)))
     return bboxes
 
 
@@ -160,14 +163,16 @@ def extract_images_from_pdf(pdf_path: str) -> dict:
     """Extract images from a PDF, keyed by (page_index, image_index).
 
     Strategy, per page:
-    1. Extract any embedded raster images as-is (photos, or a figure saved
-       as an actual image XObject) -- these are already a clean crop.
-    2. Otherwise, render the page to a PNG and use AWS Textract's LAYOUT
-       analysis to detect LAYOUT_FIGURE regions, then crop each one.
-    3. Only if a page has almost no extractable text at all (a genuine
-       scanned page) is it captured as one full-page screenshot. Ordinary
-       text pages with no embedded image and no detected figure are left
-       with no image, rather than being screenshotted whole.
+    1. Primary: Render the page to a high-DPI image, run AWS Textract
+       AnalyzeDocument with the LAYOUT feature, and crop each identified
+       LAYOUT_FIGURE region. This ensures full-fidelity capture of all
+       figures, including composite figures (photos with vector arrows/text
+       annotations on top) and pure vector diagrams.
+    2. Fallback (if Textract is unavailable or finds no figures on the page):
+       Extract embedded raster images as-is with PyMuPDF Pixmap RGB conversion,
+       sorted by their vertical position on the page.
+    3. Scanned Page Fallback: If a page has almost no extractable text and
+       no figures detected, capture the full-page screenshot.
 
     Returns:
         dict mapping (page_idx, img_idx) -> PNG image bytes
@@ -183,15 +188,15 @@ def extract_images_from_pdf(pdf_path: str) -> dict:
 
     print("[INFO] Extracting images from PDF...")
     extracted = {}
-    embedded_count = 0
     textract_count = 0
+    embedded_count = 0
     scanned_count = 0
 
     # Initialise Textract client once (may be None if not configured)
     textract_client = _get_textract_client()
     if textract_client is None:
-        print("[WARNING] AWS Textract not available. Only embedded raster images will be extracted.")
-        print("[WARNING] Configure AWS credentials to enable figure detection.")
+        print("[WARNING] AWS Textract not available. Falling back to embedded raster extraction.")
+        print("[WARNING] Configure AWS credentials in .env to enable layout figure detection.")
 
     try:
         pdf_doc = fitz.open(str(pdf_path))
@@ -199,63 +204,20 @@ def extract_images_from_pdf(pdf_path: str) -> dict:
 
         for page_idx in range(num_pages):
             page = pdf_doc[page_idx]
-            image_list = page.get_images(full=True)
             img_on_page = 0
 
-            # --- Tier 1: Embedded raster images (already a clean crop) ---
-            for img_info in image_list:
-                xref = img_info[0]
-                try:
-                    base_image = pdf_doc.extract_image(xref)
-                    if base_image is None:
-                        continue
+            # Render page to PNG bytes once (used for Textract analysis & cropping)
+            pix = page.get_pixmap(dpi=RENDER_DPI)
+            page_png_bytes = pix.tobytes("png")
+            page_pil = PILImage.open(io.BytesIO(page_png_bytes)) if PILImage else None
 
-                    image_bytes = base_image["image"]
-                    image_ext = base_image.get("ext", "png")
-
-                    # Convert to PNG for consistency
-                    if image_ext.lower() != "png":
-                        try:
-                            pil_img = PILImage.open(io.BytesIO(image_bytes))
-                            png_buffer = io.BytesIO()
-                            pil_img.save(png_buffer, format="PNG")
-                            image_bytes = png_buffer.getvalue()
-                        except Exception:
-                            pass
-
-                    # Skip tiny images (icons, bullets)
-                    width = base_image.get("width", 0)
-                    height = base_image.get("height", 0)
-                    if width < 50 and height < 50:
-                        continue
-
-                    extracted[(page_idx, img_on_page)] = image_bytes
-                    img_on_page += 1
-                    embedded_count += 1
-
-                except Exception as e:
-                    print(f"  [WARNING] Could not extract image from page {page_idx + 1}: {e}")
-
-            if img_on_page > 0:
-                # This page's images came from real embedded rasters -- skip
-                # Textract analysis for it.
-                continue
-
-            # --- Tier 2: Textract LAYOUT_FIGURE detection ---
-            if textract_client is not None:
-                # Render page to PNG bytes for Textract
-                pix = page.get_pixmap(dpi=RENDER_DPI)
-                page_png_bytes = pix.tobytes("png")
-
-                # Detect figures via Textract
+            # --- Tier 1: AWS Textract LAYOUT_FIGURE detection ---
+            if textract_client is not None and page_pil is not None:
                 figure_bboxes = _detect_figures_with_textract(
                     textract_client, page_png_bytes
                 )
 
                 if figure_bboxes:
-                    # Open the rendered page as a PIL image for cropping
-                    page_pil = PILImage.open(io.BytesIO(page_png_bytes))
-
                     for bbox in figure_bboxes:
                         figure_png = _crop_figure(page_pil, bbox)
                         if figure_png is not None:
@@ -264,13 +226,62 @@ def extract_images_from_pdf(pdf_path: str) -> dict:
                             textract_count += 1
 
                     if img_on_page > 0:
+                        # Successfully extracted figures identified by Textract layout
                         continue
+
+            # --- Tier 2: Fallback to Embedded raster images ---
+            image_list = page.get_images(full=True)
+            candidate_images = []
+
+            for img_info in image_list:
+                xref = img_info[0]
+                try:
+                    base_image = pdf_doc.extract_image(xref)
+                    if base_image is None:
+                        continue
+
+                    # Skip tiny images (icons, bullets)
+                    width = base_image.get("width", 0)
+                    height = base_image.get("height", 0)
+                    if width < 50 and height < 50:
+                        continue
+
+                    # Get position on page to sort by vertical reading order
+                    rects = page.get_image_rects(xref)
+                    top_y = rects[0].y0 if rects else 0
+                    left_x = rects[0].x0 if rects else 0
+
+                    # Convert CMYK/ICC to RGB PNG using PyMuPDF Pixmap
+                    try:
+                        img_pix = fitz.Pixmap(pdf_doc, xref)
+                        if img_pix.n - img_pix.alpha > 3:
+                            img_pix = fitz.Pixmap(fitz.csRGB, img_pix)
+                        if img_pix.alpha:
+                            img_pix = fitz.Pixmap(fitz.csRGB, img_pix, 0)
+                        image_bytes = img_pix.tobytes("png")
+                    except Exception:
+                        image_bytes = base_image["image"]
+
+                    candidate_images.append((top_y, left_x, image_bytes))
+
+                except Exception as e:
+                    print(f"  [WARNING] Could not extract embedded image from page {page_idx + 1}: {e}")
+
+            if candidate_images:
+                # Sort embedded images in reading order (top-to-bottom, left-to-right)
+                candidate_images.sort(key=lambda x: (x[0], x[1]))
+                for _, _, img_bytes in candidate_images:
+                    extracted[(page_idx, img_on_page)] = img_bytes
+                    img_on_page += 1
+                    embedded_count += 1
+
+                if img_on_page > 0:
+                    continue
 
             # --- Tier 3: Full-page screenshot for genuinely scanned pages ---
             page_text = page.get_text("text").strip()
             if len(page_text) < SCANNED_PAGE_TEXT_THRESHOLD:
-                pix = page.get_pixmap(dpi=RENDER_DPI)
-                extracted[(page_idx, 0)] = pix.tobytes("png")
+                extracted[(page_idx, 0)] = page_png_bytes
                 scanned_count += 1
 
         pdf_doc.close()

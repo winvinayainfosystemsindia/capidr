@@ -88,6 +88,12 @@ def main():
 
         # Call Claude API
         data = upload_pdf_and_get_response(args.pdf_path, api_key)
+        # Always cache the last API response so it's never lost if docx building fails
+        try:
+            with open(".last_response.json", "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
 
     if args.json_only:
         print(json.dumps(data, indent=2, ensure_ascii=False))
@@ -101,9 +107,7 @@ def main():
         print(f"[INFO] JSON saved to: {json_path}")
 
     # Extract images from the PDF
-    extracted_images = {}
-    if not args.from_json:
-        extracted_images = extract_images_from_pdf(args.pdf_path)
+    extracted_images = extract_images_from_pdf(args.pdf_path)
 
     # Build the Word document
     print(f"[INFO] Building Word document...")

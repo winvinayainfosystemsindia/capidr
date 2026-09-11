@@ -5,6 +5,8 @@ MML2OMML.XSL stylesheet (bundled under resources/, see constants.py) converts
 that MathML to OMML — the XML Word itself uses for editable equation objects.
 """
 
+import re
+
 from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_TAB_ALIGNMENT
 from docx.oxml.ns import qn
 from lxml import etree
@@ -44,6 +46,53 @@ def _get_omml_transform():
     return _omml_transform
 
 
+def normalize_latex(latex_str: str) -> str:
+    """Normalize LaTeX equations:
+    1. Trigonometric ratios: Convert 'cosec' to built-in 'csc' (e.g. \\cosec -> \\csc,
+       \\text{cosec} -> \\csc, cosec -> \\csc) and ensure built-in operators
+       (\\sin, \\cos, \\tan, \\csc, \\sec, \\cot) are used.
+    2. Degree symbols: Convert '^o', '^{\\text{o}}', '\\degree' to '^\\circ',
+       and handle Unicode degree symbols cleanly.
+    """
+    if not latex_str:
+        return ""
+
+    s = latex_str
+
+    # --- 1. Trigonometric replacements (cosec -> csc) ---
+    s = re.sub(r'\\operatorname\*?\{cosec\}', r'\\csc', s)
+    s = re.sub(r'\\(?:text|mathrm)\{cosec\}', r'\\csc', s)
+    s = re.sub(r'\\cosec\b', r'\\csc', s)
+    # Standalone 'cosec' word in LaTeX -> \csc
+    s = re.sub(r'(?<!\\)\bcosec\b', r'\\csc', s)
+
+    # Ensure standard trig functions have leading backslash: sin, cos, tan, csc, sec, cot
+    trig_ops = r'(sin|cos|tan|csc|sec|cot|arcsin|arccos|arctan|arccsc|arcsec|arccot|sinh|cosh|tanh|csch|sech|coth)'
+    s = re.sub(rf'(?<!\\)\b{trig_ops}\b', r'\\\1', s)
+
+    # --- 2. Degree symbol normalization ---
+    s = re.sub(r'\\degree\b', r'^{\\circ}', s)
+    s = re.sub(r'\^\{\s*(?:\\text\{[oO]\}|[oO])\s*\}', r'^{\\circ}', s)
+    s = re.sub(r'\^[oO]\b', r'^{\\circ}', s)
+    # Convert literal unicode degree '°' inside LaTeX to ^{\circ}
+    s = re.sub(r'°', r'^{\\circ}', s)
+
+    return s
+
+
+def _clean_mathml_for_omml(mathml_str: str) -> str:
+    """Clean and enhance MathML before passing to MML2OMML.XSL:
+    - Replace U+2218 (ring operator '∘' produced from \\circ) with U+00B0
+      (degree sign '°') so Word and screen readers natively identify and
+      pronounce degrees instead of 'upper circle superscript'.
+    """
+    # &#x2218; and &#8728; are Ring Operator (∘) -> replace with Degree Sign (°) &#x00B0; / &#176;
+    mathml_str = mathml_str.replace("&#x2218;", "&#x00B0;")
+    mathml_str = mathml_str.replace("&#8728;", "&#x00B0;")
+    mathml_str = mathml_str.replace("\u2218", "\u00B0")
+    return mathml_str
+
+
 def latex_to_omml(latex_str: str):
     """Convert a LaTeX equation string to an <m:oMath> lxml element.
 
@@ -58,8 +107,12 @@ def latex_to_omml(latex_str: str):
     if transform is None:
         return None
 
+    # Apply normalization (trig ratios, degree notation, etc.)
+    normalized_latex = normalize_latex(latex_str)
+
     try:
-        mathml_str = latex2mathml_converter.convert(latex_str)
+        mathml_str = latex2mathml_converter.convert(normalized_latex)
+        mathml_str = _clean_mathml_for_omml(mathml_str)
         mathml_doc = etree.fromstring(mathml_str.encode("utf-8"))
         omml_doc = transform(mathml_doc)
         return omml_doc.getroot()
